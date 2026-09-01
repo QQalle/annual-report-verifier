@@ -340,11 +340,10 @@ test("residual Övrigt labels can map to a specific renamed key using note conte
 test("semantic matching prompt explicitly treats residual labels as contextual", () => {
   const definition = requestDefinition("match-labels", { newerRows: [], olderRows: [] });
   assert.match(definition.system || "", /Residual labels such as “Övrigt”/);
-  assert.match(definition.system || "", /note title and neighboring stable rows/);
-  assert.match(definition.system || "", /Never match residual rows solely/);
-  assert.match(definition.system || "", /Wording similarity alone is insufficient/);
-  assert.match(definition.system || "", /Never create, extend, remove from, or recombine/);
-  assert.match(definition.system || "", /Prefer none over a speculative mapping/);
+  assert.match(definition.system || "", /note title\s+and neighboring stable rows/);
+  assert.match(definition.system || "", /Never match two residual rows merely because/);
+  assert.match(definition.system || "", /Use direct for one-to-one equivalent concepts/);
+  assert.match(definition.system || "", /Proposed aggregate groups have already been/);
 });
 
 test("model-assisted split rows are checked arithmetically and grouped", async () => {
@@ -446,6 +445,35 @@ test("an unequal model-assisted rename remains gray", async () => {
   assert.match(result.discrepancies[0].explanation, /exact-label deterministic alignment/);
 });
 
+test("a model-confirmed exact-label unequal value remains red", async () => {
+  const newer = [
+    reportPage(0, [2025, 2024], [
+      { label: "Summa administrationskostnader", values: [700, 633] },
+    ], { title: "NOT 5, ADMINISTRATION" }),
+    reportPage(1, [2025, 2024]),
+  ];
+  const older = [
+    reportPage(0, [2024, 2023]),
+    reportPage(1, [2024, 2023], [
+      { label: "Summa administrationskostnader", values: [632, 590] },
+    ], { title: "NOT 5, ADMINISTRATION" }),
+  ];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => ({
+      mappings: [{
+        newerIds: [newerRows[0].id],
+        olderIds: [olderRows[0].id],
+        relationship: "direct",
+      }],
+    }),
+  });
+
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].valueNew, "633");
+  assert.equal(result.discrepancies[0].valueOld, "632");
+});
+
 test("a model rename cannot override a unique exact-label discrepancy", async () => {
   const newer = [reportPage(0, [2025, 2024], [
     { label: "Revisionsarvoden", values: [140, 120] },
@@ -509,6 +537,37 @@ test("deterministic proposals surface a broader key plus folded-in prior rows", 
   assert.equal(grouped?.status, "match");
   assert.equal(grouped?.arithmetic?.expression, "68908 = 59645 + 2465 + 6798");
   assert.equal(grouped?.olderRelated?.length, 2);
+});
+
+test("an approved aggregate takes precedence over a competing direct anchor mapping", async () => {
+  const newer = [reportPage(0, [2024, 2023], [
+    { label: "Övriga förvaltningskostnader", values: [68611, 68908] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER" })];
+  const older = [reportPage(0, [2023, 2022], [
+    { label: "Övriga förvaltningskostnader", values: [59645, 50099] },
+    { label: "Trivselåtgärder", values: [2465, 4200] },
+    { label: "Bankkostnader", values: [6798, 6348] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023, {
+    resolveLabels: async (newerRows, olderRows, proposedGroups) => {
+      const proposal = proposedGroups.find((group) => group.olderIds.length === 3);
+      assert.ok(proposal);
+      return {
+        mappings: [
+          {
+            newerIds: [newerRows[0].id],
+            olderIds: [olderRows.find((row) => row.label === "Övriga förvaltningskostnader")!.id],
+            relationship: "direct",
+          },
+          proposal,
+        ],
+      };
+    },
+  });
+
+  assert.equal(result.discrepancies[0].status, "match");
+  assert.equal(result.discrepancies[0].arithmetic?.expression, "68908 = 59645 + 2465 + 6798");
 });
 
 test("semantic and arithmetic review continues beyond the first model batch", async () => {

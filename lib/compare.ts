@@ -679,10 +679,10 @@ export async function analyzePair(
       .filter((item) => item.match?.equal && !item.match.ambiguous)
       .map((item) => item.match!.candidate.id),
   );
-  const confidentMismatchNewerIds = new Set(
+  const deterministicMismatchTargets = new Map(
     preliminary
       .filter((item) => item.match?.confidentMismatch)
-      .map((item) => item.cell.id),
+      .map((item) => [item.cell.id, item.match!.candidate.id]),
   );
   const mappings: ModelMapping[] = [];
 
@@ -738,7 +738,14 @@ export async function analyzePair(
         const proposedSignatures = new Set(
           proposedGroups.map((group) => mappingSignature(group.newerIds, group.olderIds)),
         );
-        for (const mapping of response.mappings || []) {
+        // A model can occasionally return both the supplied aggregate and a
+        // competing one-to-one mapping for its anchor row. Apply the aggregate
+        // first so the exact, deterministically verified regrouping is not
+        // discarded merely because of response ordering.
+        const orderedMappings = [...(response.mappings || [])].sort(
+          (left, right) => Number(right.relationship === "aggregate") - Number(left.relationship === "aggregate"),
+        );
+        for (const mapping of orderedMappings) {
           const mappedNewerIds = [...new Set((mapping.newerIds || []).map(String))];
           const mappedOlderIds = [...new Set((mapping.olderIds || []).map(String))];
           if (mapping.relationship === "none") continue;
@@ -761,9 +768,10 @@ export async function analyzePair(
             mappedNewerIds.reduce((sum, id) => sum + (newerById.get(id)?.value || 0), 0),
             mappedOlderIds.reduce((sum, id) => sum + (olderById.get(id)?.value || 0), 0),
           );
-          const preservesDeterministicMismatch = mapping.relationship !== "direct" || mappedNewerIds.every(
-            (id) => !confidentMismatchNewerIds.has(id),
-          );
+          const preservesDeterministicMismatch = mapping.relationship !== "direct" || mappedNewerIds.every((id) => {
+            const deterministicTarget = deterministicMismatchTargets.get(id);
+            return !deterministicTarget || deterministicTarget === mappedOlderIds[0];
+          });
           if (
             !validRelationship ||
             !validTargets ||
@@ -813,12 +821,19 @@ export async function analyzePair(
         const newerExpression = newerGroup.map((item) => item.valueText).join(" + ");
         const olderExpression = olderGroup.map((item) => item.valueText).join(" + ");
         const isArithmetic = mapping.relationship === "aggregate";
+        const exactAlignedDirect = mapping.relationship === "direct" &&
+          newerGroup.length === 1 &&
+          olderGroup.length === 1 &&
+          newerGroup[0].normalizedLabel === olderGroup[0].normalizedLabel &&
+          match?.candidate.id === olderGroup[0].id &&
+          match.labelScore === 1 &&
+          !match.ambiguous;
         const operator = equal ? "=" : "≠";
         discrepancies.push({
           id: `comparison-model-${mapping.newerIds.join("-")}`,
-          // A model-assisted rename is useful alignment evidence, but only a
-          // unique exact-label deterministic match may become a red mismatch.
-          status: equal ? "match" : "missing",
+          // An unequal semantic rename stays uncertain, while a model-confirmed
+          // exact-label alignment retains the deterministic red discrepancy.
+          status: equal ? "match" : exactAlignedDirect ? "mismatch" : "missing",
           year: newerGroup[0].year,
           section: newerGroup[0].section,
           labelNew: newerGroup.map((item) => item.label).join(" + "),
@@ -830,7 +845,9 @@ export async function analyzePair(
             ? `${newerGroup[0].year}: ${newerExpression} ${operator} ${olderExpression}. The model identified a semantically coherent split/merge; the totals were checked deterministically.`
             : equal
               ? describe("match", newerGroup[0], olderGroup[0], olderExpression)
-              : `${newerGroup[0].year}: the model found a possible renamed counterpart, but unequal values require an exact-label deterministic alignment before a discrepancy can be flagged.`,
+              : exactAlignedDirect
+                ? describe("mismatch", newerGroup[0], olderGroup[0], olderExpression)
+                : `${newerGroup[0].year}: the model found a possible renamed counterpart, but unequal values require an exact-label deterministic alignment before a discrepancy can be flagged.`,
           newer: evidence(newerGroup[0]),
           older: evidence(olderGroup[0]),
           newerRelated: newerGroup.slice(1).map(evidence),
