@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import type { ModelCall, ModelProvider, ModelUsage } from "./types";
-import { DEFAULT_MODELS, type ModelId } from "./model-config";
+import { DEFAULT_MODELS, selectConfiguredProvider, type ModelId } from "./model-config";
 
 type ModelPurpose = ModelCall["purpose"];
 type ProviderMap<T> = Record<ModelProvider, T>;
@@ -52,12 +52,14 @@ export function ModelProviderRoot({ children }: { children: ReactNode }) {
   useEffect(() => {
     fetch("/api/model")
       .then((response) => response.json())
-      .then((data) =>
-        setEnvConfigured({
+      .then((data) => {
+        const configured = {
           openai: Boolean(data.openai),
           anthropic: Boolean(data.anthropic),
-        }),
-      )
+        };
+        setEnvConfigured(configured);
+        setProvider((current) => selectConfiguredProvider(current, configured));
+      })
       .catch(() => setEnvConfigured({ openai: false, anthropic: false }));
   }, []);
 

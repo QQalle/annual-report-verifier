@@ -26,3 +26,13 @@ export const DEFAULT_MODELS: Record<ModelProvider, ModelId> = {
 export function isModelForProvider(provider: ModelProvider, model: string): model is ModelId {
   return MODEL_OPTIONS[provider].some((option) => option.id === model);
 }
+
+export function selectConfiguredProvider(
+  current: ModelProvider,
+  configured: Record<ModelProvider, boolean>,
+): ModelProvider {
+  if (configured[current]) return current;
+  if (configured.anthropic) return "anthropic";
+  if (configured.openai) return "openai";
+  return current;
+}

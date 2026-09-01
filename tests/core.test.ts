@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { requestDefinition } from "../app/api/model/route.ts";
 import { analyzePair } from "../lib/compare.ts";
+import { selectConfiguredProvider } from "../lib/model-config.ts";
 import type { BrowserPdf } from "../lib/pdf-engine.ts";
 import { alterNumber, isNumberText, mergeTextFragments, parseSwedishNumber } from "../lib/pdf-engine.ts";
 import type { ExtractedPage, PdfLine, PdfToken, Rect } from "../lib/types.ts";
@@ -146,6 +147,11 @@ test("parses annual-report number formats", () => {
   assert.equal(parseSwedishNumber("not a number"), null);
 });
 
+test("selects Anthropic automatically when it is the only configured provider", () => {
+  assert.equal(selectConfiguredProvider("openai", { openai: false, anthropic: true }), "anthropic");
+  assert.equal(selectConfiguredProvider("openai", { openai: true, anthropic: true }), "openai");
+});
+
 test("recognizes complete numeric tokens only", () => {
   assert.equal(isNumberText("6 104"), true);
   assert.equal(isNumberText("2,28"), true);
@@ -196,6 +202,30 @@ test("recognizes a multi-year NYCKELTAL header and compares the whole page", asy
   assert.deepEqual([...new Set(result.discrepancies.map((item) => item.section))], ["Multi-year overview"]);
 });
 
+test("compares and labels every opening balance in changes in equity", async () => {
+  const newer = [reportPage(0, ["2023-12-31", "2024-12-31"], [
+    { label: "Insatser", values: [72134, 72134] },
+    { label: "Upplåtelseavgifter", values: [679332, 679332] },
+    { label: "Fond, yttre underhåll", values: [707361, 555269] },
+    { label: "Balanserat resultat", values: [7039982, 7591102] },
+    { label: "Årets resultat", values: [399028, -1551827] },
+    { label: "Eget kapital", values: [8897837, 7346010] },
+  ], { title: "DISPONERING AV FÖREGÅENDE ÅRS RESULTAT" })];
+  const older = [reportPage(0, ["2022-12-31", "2023-12-31"], [
+    { label: "Insatser", values: [72134, 72134] },
+    { label: "Upplåtelseavgifter", values: [679332, 679332] },
+    { label: "Fond, yttre underhåll", values: [286953, 707361] },
+    { label: "Balanserat resultat", values: [6640963, 7039982] },
+    { label: "Årets resultat", values: [819427, 399028] },
+    { label: "Eget kapital", values: [8498809, 8897837] },
+  ], { title: "DISPONERING AV FÖREGÅENDE ÅRS RESULTAT" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  assert.equal(result.discrepancies.length, 6);
+  assert.ok(result.discrepancies.every((item) => item.status === "match"));
+  assert.ok(result.discrepancies.every((item) => item.section === "Changes in equity"));
+});
+
 test("keeps short accounting labels such as VA and El", async () => {
   const newer = [reportPage(0, [2025, 2024], [
     { label: "VA", values: [20, 14] },
@@ -234,7 +264,7 @@ test("scrambled numbers stay numeric and change", () => {
   assert.notEqual(parseSwedishNumber(replacement), null);
 });
 
-test("equal repeated rows are matched green instead of aligning to a nearer unequal row", async () => {
+test("equal repeated rows use the agreeing context instead of an unequal duplicate", async () => {
   const newerPages = Array.from({ length: 6 }, (_, page) =>
     reportPage(page, [2025, 2024], page === 2 ? [{ label: "Nettoomsättning", values: [130, 100] }] : []),
   );
@@ -442,7 +472,7 @@ test("an unequal model-assisted rename remains gray", async () => {
   assert.equal(result.modelAssisted, 1);
   assert.equal(result.discrepancies[0].status, "missing");
   assert.equal(result.discrepancies[0].matchMethod, "model");
-  assert.match(result.discrepancies[0].explanation, /exact-label deterministic alignment/);
+  assert.match(result.discrepancies[0].explanation, /unique exact-label deterministic alignment/);
 });
 
 test("a model-confirmed exact-label unequal value remains red", async () => {
@@ -453,10 +483,10 @@ test("a model-confirmed exact-label unequal value remains red", async () => {
     reportPage(1, [2025, 2024]),
   ];
   const older = [
-    reportPage(0, [2024, 2023]),
-    reportPage(1, [2024, 2023], [
+    reportPage(0, [2024, 2023], [
       { label: "Summa administrationskostnader", values: [632, 590] },
     ], { title: "NOT 5, ADMINISTRATION" }),
+    reportPage(1, [2024, 2023]),
   ];
 
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {

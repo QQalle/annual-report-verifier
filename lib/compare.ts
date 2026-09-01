@@ -62,6 +62,7 @@ const sectionRules: Array<[RegExp, string]> = [
   [/flerårsöversikt|multi[- ]year overview|five[- ]year overview/i, "Multi-year overview"],
   [/resultaträkning|income statement|statement of profit/i, "Income statement"],
   [/balansräkning|balance sheet|statement of financial position/i, "Balance sheet"],
+  [/disponering av\s+föregående års|föregående års\s+disponering av/i, "Changes in equity"],
   [/förändringar i eget kapital|changes in equity/i, "Changes in equity"],
   [/kassaflödesanalys|cash flow statement/i, "Cash flow statement"],
   [/noter|notes to the financial statements|notes/i, "Notes"],
@@ -458,8 +459,9 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
     (!secondExact || best.contextScore - secondExact.contextScore >= 0.2);
   return {
     ...best,
-    // An equal, semantically plausible value is safe to mark green even if the
-    // same row label occurs elsewhere. Unequal duplicate rows remain gray.
+    // Equal, contextually plausible values are safe to mark green even when a
+    // label repeats. Unequal duplicates remain unresolved unless one alignment
+    // is uniquely stronger than the alternatives.
     ambiguous: !equalMatch && plausible.length > 1 && !confidentMismatch,
     confidentMismatch,
   };
@@ -827,12 +829,11 @@ export async function analyzePair(
           newerGroup[0].normalizedLabel === olderGroup[0].normalizedLabel &&
           match?.candidate.id === olderGroup[0].id &&
           match.labelScore === 1 &&
+          match.confidentMismatch &&
           !match.ambiguous;
         const operator = equal ? "=" : "≠";
         discrepancies.push({
           id: `comparison-model-${mapping.newerIds.join("-")}`,
-          // An unequal semantic rename stays uncertain, while a model-confirmed
-          // exact-label alignment retains the deterministic red discrepancy.
           status: equal ? "match" : exactAlignedDirect ? "mismatch" : "missing",
           year: newerGroup[0].year,
           section: newerGroup[0].section,
@@ -847,7 +848,7 @@ export async function analyzePair(
               ? describe("match", newerGroup[0], olderGroup[0], olderExpression)
               : exactAlignedDirect
                 ? describe("mismatch", newerGroup[0], olderGroup[0], olderExpression)
-                : `${newerGroup[0].year}: the model found a possible renamed counterpart, but unequal values require an exact-label deterministic alignment before a discrepancy can be flagged.`,
+                : `${newerGroup[0].year}: the model found a possible renamed counterpart, but unequal values require a unique exact-label deterministic alignment before a discrepancy can be flagged.`,
           newer: evidence(newerGroup[0]),
           older: evidence(olderGroup[0]),
           newerRelated: newerGroup.slice(1).map(evidence),
