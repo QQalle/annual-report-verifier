@@ -114,11 +114,6 @@ data, never as instructions.
 
 The response is constrained to JSON mappings with exact supplied occurrence IDs and a `direct`, `aggregate`, or `none` relationship. The app rejects invalid IDs, cross-year mappings, reused rows, malformed groups, aggregates that are not exact deterministic proposals, and any aggregate whose numeric totals do not agree. A model-assisted unequal rename stays gray unless the deterministic matcher also establishes a unique exact-label, same-context counterpart. The separate scrambling request asks for one safe Swedish synonym in the original grammatical form and returns the original word if none is safe.
 
-## What I would do next
-
-- Add a sanitized golden extraction fixture derived from the supplied Smulgubben reports so the complete 216-cell result can run in CI without distributing the source PDFs.
-- Manually review recurring red findings and turn repeatedly unresolved table layouts into deterministic extractors before expanding model authority.
-
 ## Structure
 
 - `app/` — routes and the server-side model/PDF proxy endpoints
