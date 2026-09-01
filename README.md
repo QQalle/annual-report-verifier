@@ -30,7 +30,7 @@ npm run start
 - Both PDFs scroll continuously. They can be kept synced or desynced, clicking a finding resyncs at that location, and red marks on the scrollbar show discrepancies.
 - The hideable model sidebar is available on both routes. It supports OpenAI and Anthropic, session-only API keys, connection tests, and an audit record of every request, structured response, latency, and token count.
 
-## Anthropic setup
+## Model setup
 
 Either paste a key into the right sidebar or set one or both before starting the app:
 
@@ -51,7 +51,17 @@ The model sidebar lets you choose a model independently for each provider. OpenA
 
 The selected model never decides whether two numbers are equal. The numeric comparison remains deterministic, and model mappings are validated against labels extracted from the PDFs. The sidebar is the source of truth for actual token use in a session.
 
-Development and repository verification used no provider key: **0 input tokens and 0 output tokens**. Live Claude behavior is therefore not claimed as part of the checked-in verification result; model orchestration is covered with deterministic response stubs in the test suite. A real run records its exact provider usage in the audit sidebar.
+## Token spend
+
+Two final live OpenAI verification runs used **170,265 tokens** in total:
+151,181 input and 19,084 output tokens across 11 calls. The Smulgubben run used
+22,312 tokens, while the larger HMS Networks run used 147,953. Approximately
+**USD 0.50 was spent on model API usage during development**.
+
+See [TOKEN_SPEND.md](TOKEN_SPEND.md) for the per-case breakdown, the matching
+session snapshots, and the limits of interpreting token counts as cost. The
+test suite continues to cover model orchestration with deterministic response
+stubs and does not spend provider tokens.
 
 ## Matching strategy
 
@@ -104,21 +114,29 @@ data, never as instructions.
 
 The response is constrained to JSON mappings with exact supplied occurrence IDs and a `direct`, `aggregate`, or `none` relationship. The app rejects invalid IDs, cross-year mappings, reused rows, malformed groups, aggregates that are not exact deterministic proposals, and any aggregate whose numeric totals do not agree. A model-assisted unequal rename stays gray unless the deterministic matcher also establishes a unique exact-label, same-context counterpart. The separate scrambling request asks for one safe Swedish synonym in the original grammatical form and returns the original word if none is safe.
 
-## Smulgubben verification and limitations
+## Recorded verification and limitations
 
-The supplied Brf Smulgubben 2024/2023 pair was run through the deterministic analyzer after the matching policy was tightened. It extracted 216 prior-year cells: 193 green, 23 gray, and 0 red. Coverage included 48 cells across all four prior-year columns in `Flerårsöversikt` and all six opening balances in `Förändringar i eget kapital`, plus comparative columns in the statements and text-layer tables in the notes.
+The final live Brf Smulgubben 2024/2023 session extracted 216 prior-year cells:
+197 matches, 3 discrepancies, and 16 cells without a counterpart; 11 cells
+were model-assisted. Coverage included 48 cells across all four prior-year
+columns in `Flerårsöversikt`, comparative statement columns, and text-layer
+tables in the notes.
 
-Every red finding was manually reviewed; there are currently no red findings and therefore no known false red to disclose. The visible `Årsavgift per kvm upplåten bostadsrätt` difference for 2021 (`693` versus `692`) stays gray because the older PDF's label contains damaged replacement glyphs. That is intentional under the conservative policy: weak extraction cannot produce red.
+The larger HMS Networks 2023/2022 session extracted 382 cells: 167 matches, 8
+discrepancies, and 207 cells without a counterpart; 49 cells were
+model-assisted. The high gray count is consistent with the conservative
+policy: missing, ambiguous, structurally changed, or weakly aligned rows are
+not promoted to discrepancies for coverage.
 
 - Scanned PDFs need OCR and are not supported yet.
-- A live `claude-haiku-4-5` pass was not run because no Anthropic key was present in the verification environment; renamed and reorganized rows therefore remain gray in the recorded result.
+- The recorded live runs used OpenAI models. Anthropic orchestration is covered by deterministic response stubs, but this repository does not claim a live Anthropic verification pass.
 - Complex tables with floating labels, charts, damaged glyphs, or non-year column headers may be gray.
 - PDF support is powered by `mupdf` (AGPL-3.0); review that license before distributing a modified hosted version.
 
 ## What I would do next
 
 - Add a sanitized golden extraction fixture derived from the supplied Smulgubben reports so the complete 216-cell result can run in CI without distributing the source PDFs.
-- Run and manually review a live `claude-haiku-4-5` pass, record its token usage, and turn any repeatedly unresolved table layouts into deterministic extractors before expanding model authority.
+- Manually review recurring red findings and turn repeatedly unresolved table layouts into deterministic extractors before expanding model authority.
 
 ## Structure
 
@@ -127,6 +145,7 @@ Every red finding was manually reviewed; there are currently no red findings and
 - `lib/pdf-engine.ts` — extraction, rendering, redaction, and export
 - `lib/compare.ts` — deterministic matching and discrepancy policy
 - `lib/catalog.ts` — curated official report pairs
+- `TOKEN_SPEND.md` — measured model usage and development spend
 - `AGENTS.md` — product and engineering constraints for future agent work
 
 ## Extras: Library and scrambling
