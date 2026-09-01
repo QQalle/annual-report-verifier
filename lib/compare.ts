@@ -6,6 +6,7 @@ import type {
   ExtractedPage,
   PdfLine,
   PdfToken,
+  Rect,
   SectionJump,
 } from "./types";
 
@@ -21,17 +22,28 @@ type ComparableCell = {
   token: PdfToken;
   relativePage: number;
   tableIndex: number;
+  labelRect: Rect;
+  yearRect: Rect;
+};
+
+type ModelRow = {
+  id: string;
+  label: string;
+  section: string;
+  year: number;
+  page: number;
+  table: number;
 };
 
 type ModelMapping = {
-  labelNew: string;
-  labelsOld: string[];
+  newerId: string;
+  olderIds: string[];
   relationship: "direct" | "aggregate" | "none";
 };
 
 type ResolveLabels = (
-  labelsNew: string[],
-  labelsOld: string[],
+  newerRows: ModelRow[],
+  olderRows: ModelRow[],
 ) => Promise<{ mappings: ModelMapping[] }>;
 
 const sectionRules: Array<[RegExp, string]> = [
@@ -115,14 +127,25 @@ function yearFromToken(token: PdfToken) {
 }
 
 function leadingLabel(line: PdfLine, number: PdfToken, labelCutoff: number, previous?: PdfLine) {
-  const text = line.tokens
-    .filter((token) => token.rect[2] <= Math.min(number.rect[0] + 1, labelCutoff) && !token.isNumber)
-    .map((token) => token.text)
-    .join(" ")
-    .trim();
-  if (text) return text;
-  if (previous && !previous.tokens.some((token) => token.isNumber)) return previous.text.trim();
-  return "";
+  const tokens = line.tokens
+    .filter((token) => token.rect[2] <= Math.min(number.rect[0] + 1, labelCutoff) && !token.isNumber);
+  if (tokens.length) {
+    const rect = tokens.reduce<Rect | null>(
+      (box, token) =>
+        box
+          ? [
+              Math.min(box[0], token.rect[0]),
+              Math.min(box[1], token.rect[1]),
+              Math.max(box[2], token.rect[2]),
+              Math.max(box[3], token.rect[3]),
+            ]
+          : token.rect,
+      null,
+    );
+    return { text: tokens.map((token) => token.text).join(" ").trim(), rect: rect! };
+  }
+  if (previous && !previous.tokens.some((token) => token.isNumber)) return { text: previous.text.trim(), rect: previous.rect };
+  return null;
 }
 
 function extractCells(pages: ExtractedPage[]) {
@@ -171,7 +194,8 @@ function extractCells(pages: ExtractedPage[]) {
           90,
         );
         const labelCutoff = leftmostYear - Math.min(84, smallestYearGap * 1.08);
-        const label = leadingLabel(line, number, labelCutoff, page.lines[index - 1]);
+        const labelInfo = leadingLabel(line, number, labelCutoff, page.lines[index - 1]);
+        const label = labelInfo?.text || "";
         const normalizedLabel = normalizeLabel(label);
         const value = parseSwedishNumber(number.text);
         if (
@@ -192,6 +216,8 @@ function extractCells(pages: ExtractedPage[]) {
           token: number,
           relativePage: page.page / Math.max(1, pages.length - 1),
           tableIndex: header.tableIndex,
+          labelRect: labelInfo!.rect,
+          yearRect: nearest.token.rect,
         });
       }
     }
@@ -203,44 +229,80 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
   const scored = candidates
     .map((candidate) => {
       const label = labelSimilarity(cell.normalizedLabel, candidate.normalizedLabel);
-      const section = cell.section === candidate.section ? 0.14 : 0;
-      const proximity = Math.max(0, 0.08 - Math.abs(cell.relativePage - candidate.relativePage) * 0.08);
-      const table = cell.tableIndex === candidate.tableIndex ? 0.24 : -Math.min(0.18, Math.abs(cell.tableIndex - candidate.tableIndex) * 0.06);
+      const section = cell.section === candidate.section ? 0.18 : -0.08;
+      const pageDistance = Math.abs(cell.relativePage - candidate.relativePage);
+      const proximity = Math.max(0, 0.16 - pageDistance * 0.65);
+      const table = cell.tableIndex === candidate.tableIndex ? 0.05 : 0;
       const valueDisambiguation =
-        label >= 0.8 && Math.abs(cell.value - candidate.value) < 0.000001 ? 0.5 : 0;
+        label >= 0.8 && Math.abs(cell.value - candidate.value) < 0.000001 ? 0.58 : 0;
       return {
         candidate,
         score: label + section + proximity + table + valueDisambiguation,
         labelScore: label,
+        contextScore: section + proximity + table,
+        equal: Math.abs(cell.value - candidate.value) < 0.000001,
       };
     })
     .filter((item) => item.labelScore >= 0.62)
     .sort((a, b) => b.score - a.score);
-  const best = scored[0];
+  const equalMatch = scored.find(
+    (item) =>
+      item.equal &&
+      item.candidate.section === cell.section &&
+      Math.abs(item.candidate.relativePage - cell.relativePage) < 0.24 &&
+      item.labelScore >= 0.8,
+  );
+  const best = equalMatch || scored[0];
   if (!best) return undefined;
   const plausible = scored.filter(
     (item) =>
-      item.labelScore >= Math.max(0.8, best.labelScore - 0.04) &&
-      Math.abs(item.candidate.relativePage - cell.relativePage) < 0.18,
+      item.labelScore >= Math.max(0.84, best.labelScore - 0.06) &&
+      item.candidate.section === cell.section &&
+      Math.abs(item.candidate.relativePage - cell.relativePage) < 0.2,
   );
-  return { ...best, ambiguous: plausible.length > 1 };
+  const exactCandidates = scored.filter((item) => item.labelScore === 1);
+  const secondExact = exactCandidates.find((item) => item.candidate.id !== best.candidate.id);
+  const confidentMismatch =
+    best.labelScore === 1 &&
+    best.candidate.section === cell.section &&
+    Math.abs(best.candidate.relativePage - cell.relativePage) < 0.18 &&
+    (!secondExact || best.contextScore - secondExact.contextScore >= 0.2);
+  return {
+    ...best,
+    // An equal, semantically plausible value is safe to mark green even if the
+    // same row label occurs elsewhere. Unequal duplicate rows remain gray.
+    ambiguous: !equalMatch && plausible.length > 1 && !confidentMismatch,
+    confidentMismatch,
+  };
 }
 
 function describe(
   status: Discrepancy["status"],
   cell: ComparableCell,
   source?: ComparableCell,
-  ambiguous = false,
+  sourceValueText?: string,
+  uncertain = false,
 ) {
   if (status === "match") {
-    return `${cell.year}: ${cell.valueText} agrees with the prior report${source ? ` (${source.valueText})` : ""}.`;
+    return `${cell.year}: ${cell.valueText} agrees with the prior report${sourceValueText ? ` (${sourceValueText})` : ""}.`;
   }
   if (status === "mismatch") {
-    return `${cell.year}: ${cell.valueText} does not agree with the prior report${source ? ` (${source.valueText})` : ""}.`;
+    return `${cell.year}: ${cell.valueText} does not agree with the prior report${sourceValueText ? ` (${sourceValueText})` : ""}.`;
   }
-  return ambiguous
-    ? `${cell.year}: more than one plausible counterpart was found, so this cell was not judged.`
+  return uncertain && source
+    ? `${cell.year}: a possible counterpart was found, but the row alignment was not reliable enough to judge.`
     : `${cell.year}: no reliable counterpart was found in the prior report.`;
+}
+
+function toModelRow(cell: ComparableCell): ModelRow {
+  return {
+    id: cell.id,
+    label: cell.label,
+    section: cell.section,
+    year: cell.year,
+    page: cell.page + 1,
+    table: cell.tableIndex + 1,
+  };
 }
 
 function buildSectionJumps(
@@ -288,7 +350,8 @@ export async function analyzePair(
   );
   options?.onProgress?.(0.88, "Matching comparative rows");
 
-  const newerCells = extractCells(newerPages).filter((cell) => cell.year < newerYear);
+  const allNewerCells = extractCells(newerPages);
+  const newerCells = allNewerCells.filter((cell) => cell.year < newerYear);
   const olderCells = extractCells(olderPages);
   const olderByYear = new Map<number, ComparableCell[]>();
   for (const cell of olderCells) {
@@ -297,37 +360,54 @@ export async function analyzePair(
     olderByYear.set(cell.year, list);
   }
 
-  const occurrenceKey = (cell: ComparableCell) => `${cell.year}:${cell.normalizedLabel}`;
-  const newerOccurrences = new Map<string, number>();
-  const olderOccurrences = new Map<string, number>();
-  for (const cell of newerCells) {
-    const key = occurrenceKey(cell);
-    newerOccurrences.set(key, (newerOccurrences.get(key) || 0) + 1);
-  }
-  for (const cell of olderCells) {
-    const key = occurrenceKey(cell);
-    olderOccurrences.set(key, (olderOccurrences.get(key) || 0) + 1);
-  }
-
   const preliminary = newerCells.map((cell) => ({
     cell,
     match: bestCandidate(cell, olderByYear.get(cell.year) || []),
   }));
-  const unresolved = preliminary.filter((item) => !item.match);
+  const unresolved = preliminary.filter(
+    (item) =>
+      !item.match ||
+      (!item.match.equal && (!item.match.confidentMismatch || item.match.ambiguous)),
+  );
   const mappings = new Map<string, ModelMapping>();
 
   if (unresolved.length && options?.resolveLabels) {
-    const labelsNew = [...new Set(unresolved.map((item) => item.cell.label))].slice(0, 80);
-    const relevantYears = new Set(unresolved.map((item) => item.cell.year));
-    const labelsOld = [
-      ...new Set(olderCells.filter((cell) => relevantYears.has(cell.year)).map((cell) => cell.label)),
-    ].slice(0, 120);
-    if (labelsNew.length && labelsOld.length) {
+    const newerRows = unresolved.slice(0, 80).map((item) => toModelRow(item.cell));
+    const olderCandidates = new Map<string, ComparableCell>();
+    for (const { cell } of unresolved.slice(0, 80)) {
+      const candidates = (olderByYear.get(cell.year) || [])
+        .filter(
+          (candidate) =>
+            candidate.section === cell.section ||
+            Math.abs(candidate.relativePage - cell.relativePage) < 0.14,
+        )
+        .sort(
+          (a, b) =>
+            Number(b.section === cell.section) - Number(a.section === cell.section) ||
+            Math.abs(a.relativePage - cell.relativePage) -
+              Math.abs(b.relativePage - cell.relativePage),
+        )
+        .slice(0, 30);
+      for (const candidate of candidates) olderCandidates.set(candidate.id, candidate);
+    }
+    const olderRows = [...olderCandidates.values()].slice(0, 160).map(toModelRow);
+    if (newerRows.length && olderRows.length) {
       options.onProgress?.(0.91, "Resolving renamed rows with the selected model");
       try {
-        const response = await options.resolveLabels(labelsNew, labelsOld);
+        const response = await options.resolveLabels(newerRows, olderRows);
+        const newerIds = new Set(newerRows.map((row) => row.id));
+        const olderIds = new Set(olderRows.map((row) => row.id));
         for (const mapping of response.mappings || []) {
-          if (labelsNew.includes(mapping.labelNew)) mappings.set(mapping.labelNew, mapping);
+          const mappedOlderIds = [...new Set((mapping.olderIds || []).map(String))];
+          const validRelationship = mapping.relationship === "none"
+            ? mappedOlderIds.length === 0
+            : mapping.relationship === "direct"
+              ? mappedOlderIds.length === 1
+              : mappedOlderIds.length >= 2;
+          const validTargets = mappedOlderIds.every((id) => olderIds.has(id));
+          if (newerIds.has(mapping.newerId) && validRelationship && validTargets) {
+            mappings.set(mapping.newerId, { ...mapping, olderIds: mappedOlderIds });
+          }
         }
       } catch {
         // Deterministic results remain valid; unresolved cells stay gray.
@@ -344,47 +424,43 @@ export async function analyzePair(
         : "similar"
       : "none";
     let aggregateValue: number | null = null;
-    let ambiguous = Boolean(match?.ambiguous);
-    let confidentMismatch = Boolean(
-      match &&
-        !match.ambiguous &&
-        match.labelScore === 1 &&
-        newerOccurrences.get(occurrenceKey(cell)) === 1 &&
-        olderOccurrences.get(occurrenceKey(match.candidate)) === 1 &&
-        cell.tableIndex === match.candidate.tableIndex &&
-        Math.abs(cell.relativePage - match.candidate.relativePage) < 0.1,
-    );
-
-    if (!source) {
-      const mapping = mappings.get(cell.label);
-      if (mapping && mapping.relationship !== "none" && mapping.labelsOld.length) {
-        const normalizedTargets = mapping.labelsOld.map(normalizeLabel);
-        const sources = (olderByYear.get(cell.year) || []).filter((candidate) =>
-          normalizedTargets.includes(candidate.normalizedLabel),
+    let sourceValueText = source?.valueText;
+    let uncertain = Boolean(match?.ambiguous);
+    let confidentMismatch = Boolean(match?.confidentMismatch);
+    if (!source || (!match?.equal && (!match?.confidentMismatch || match?.ambiguous))) {
+      const mapping = mappings.get(cell.id);
+      if (mapping && mapping.relationship !== "none" && mapping.olderIds.length) {
+        const selectedIds = new Set(mapping.olderIds);
+        const sources = olderCells.filter(
+          (candidate) => candidate.year === cell.year && selectedIds.has(candidate.id),
         );
-        if (sources.length === normalizedTargets.length) {
+        if (
+          sources.length === mapping.olderIds.length &&
+          (mapping.relationship === "aggregate" || sources.length === 1)
+        ) {
           source = sources[0];
           aggregateValue = sources.reduce((sum, item) => sum + item.value, 0);
+          sourceValueText = sources.map((item) => item.valueText).join(" + ");
           method = "model";
           modelAssisted += 1;
-          ambiguous = false;
-          confidentMismatch =
-            mapping.relationship === "direct" &&
-            sources.length === 1 &&
-            newerOccurrences.get(occurrenceKey(cell)) === 1 &&
-            olderOccurrences.get(occurrenceKey(source)) === 1 &&
-            Math.abs(cell.relativePage - source.relativePage) < 0.1;
+          uncertain = false;
+          confidentMismatch = true;
         }
       }
     }
 
     const comparedValue = aggregateValue ?? source?.value ?? null;
-    const status: Discrepancy["status"] =
-      comparedValue === null || (comparedValue !== null && Math.abs(cell.value - comparedValue) >= 0.000001 && !confidentMismatch)
-        ? "missing"
-        : Math.abs(cell.value - comparedValue) < 0.000001
-          ? "match"
-          : "mismatch";
+    const equal = comparedValue !== null && Math.abs(cell.value - comparedValue) < 0.000001;
+    // A source is judged only after the label match has cleared ambiguity checks.
+    // Equality is deterministic; the model can supply a label relationship but
+    // never gets to decide whether the numbers agree.
+    const status: Discrepancy["status"] = comparedValue === null
+      ? "missing"
+      : equal
+        ? "match"
+        : confidentMismatch && !uncertain
+          ? "mismatch"
+          : "missing";
     return {
       id: `comparison-${cell.id}`,
       status,
@@ -393,12 +469,24 @@ export async function analyzePair(
       labelNew: cell.label,
       labelOld: source?.label,
       valueNew: cell.valueText,
-      valueOld: source?.valueText,
+      valueOld: sourceValueText,
       matchMethod: method,
-      explanation: describe(status, cell, source, ambiguous || (!confidentMismatch && comparedValue !== null)),
-      newer: { page: cell.page, rect: cell.token.rect, tokenId: cell.token.id },
+      explanation: describe(status, cell, source, sourceValueText, comparedValue !== null && status === "missing"),
+      newer: {
+        page: cell.page,
+        rect: cell.token.rect,
+        tokenId: cell.token.id,
+        keyRect: cell.labelRect,
+        yearRect: cell.yearRect,
+      },
       older: source
-        ? { page: source.page, rect: source.token.rect, tokenId: source.token.id }
+        ? {
+            page: source.page,
+            rect: source.token.rect,
+            tokenId: source.token.id,
+            keyRect: source.labelRect,
+            yearRect: source.yearRect,
+          }
         : undefined,
     };
   });
@@ -406,6 +494,12 @@ export async function analyzePair(
   options?.onProgress?.(1, "Analysis complete");
   return {
     discrepancies,
+    numberHighlights: {
+      newer: allNewerCells
+        .filter((cell) => cell.year === newerYear)
+        .map((cell) => ({ page: cell.page, rect: cell.token.rect, tokenId: cell.token.id })),
+      older: [],
+    },
     sections: buildSectionJumps(discrepancies, newerPages.length, olderPages.length),
     newerYear,
     olderYear,

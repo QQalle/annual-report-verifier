@@ -85,7 +85,25 @@ export function ModelProviderRoot({ children }: { children: ReactNode }) {
           }),
         });
         const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Model request failed");
+        if (!response.ok) {
+          const message = data.error || "Model request failed";
+          setCalls((current) =>
+            current.map((call) =>
+              call.id === id
+                ? {
+                    ...call,
+                    status: "error",
+                    error: message,
+                    request: data.request ?? call.request,
+                    response: data.response,
+                    usage: data.usage,
+                    latencyMs: data.latencyMs,
+                  }
+                : call,
+            ),
+          );
+          throw new Error(message);
+        }
 
         setCalls((current) =>
           current.map((call) =>

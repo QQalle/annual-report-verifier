@@ -75,9 +75,11 @@ export type Discrepancy = {
   valueOld?: string;
   matchMethod: "exact" | "similar" | "model" | "none";
   explanation: string;
-  newer: { page: number; rect: Rect; tokenId: string };
-  older?: { page: number; rect: Rect; tokenId: string };
+  newer: { page: number; rect: Rect; tokenId: string; keyRect?: Rect; yearRect?: Rect };
+  older?: { page: number; rect: Rect; tokenId: string; keyRect?: Rect; yearRect?: Rect };
 };
+
+export type NumberHighlight = { page: number; rect: Rect; tokenId: string };
 
 export type SectionJump = {
   id: string;
@@ -89,6 +91,7 @@ export type SectionJump = {
 
 export type AnalysisResult = {
   discrepancies: Discrepancy[];
+  numberHighlights: { newer: NumberHighlight[]; older: NumberHighlight[] };
   sections: SectionJump[];
   newerYear: number;
   olderYear: number;

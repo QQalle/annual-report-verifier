@@ -1159,6 +1159,22 @@ button:disabled {
   z-index: 4;
 }
 
+.number-highlight-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.number-highlight {
+  position: absolute;
+  min-width: 3px;
+  min-height: 3px;
+  background: rgba(255, 220, 66, 0.34);
+  border: 1px solid rgba(194, 150, 0, 0.45);
+  border-radius: 2px;
+}
+
 .token-hit,
 .pdf-highlight {
   position: absolute;
@@ -1168,6 +1184,23 @@ button:disabled {
   border-radius: 2px;
   pointer-events: auto;
   cursor: pointer;
+}
+
+.pdf-context-highlight {
+  position: absolute;
+  z-index: 8;
+  min-width: 3px;
+  min-height: 3px;
+  background: rgba(255, 220, 66, 0.3);
+  border: 1px solid rgba(194, 150, 0, 0.58);
+  border-radius: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 100ms ease;
+}
+
+.pdf-context-highlight.active {
+  opacity: 1;
 }
 
 .token-hit {

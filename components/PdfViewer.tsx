@@ -9,9 +9,9 @@ import {
   Plus,
   RotateCcw,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { BrowserPdf } from "@/lib/pdf-engine";
-import type { Discrepancy, PdfToken, Rect, RenderedPage } from "@/lib/types";
+import type { Discrepancy, NumberHighlight, PdfToken, Rect, RenderedPage } from "@/lib/types";
 
 function position(rect: Rect, bounds: Rect) {
   const width = bounds[2] - bounds[0];
@@ -38,6 +38,7 @@ type PdfViewerProps = {
   interactive?: boolean;
   onTokenSelect?: (token: PdfToken) => void;
   highlights?: Discrepancy[];
+  numberHighlights?: NumberHighlight[];
   highlightSide?: "newer" | "older";
   activeHighlight?: string | null;
   onHighlight?: (id: string | null) => void;
@@ -58,6 +59,7 @@ export function PdfViewer({
   interactive,
   onTokenSelect,
   highlights = [],
+  numberHighlights = [],
   highlightSide = "newer",
   activeHighlight,
   onHighlight,
@@ -102,6 +104,7 @@ export function PdfViewer({
       }),
     [highlights, highlightSide, page],
   );
+  const pageNumberHighlights = numberHighlights.filter((highlight) => highlight.page === page);
 
   return (
     <section className="pdf-viewer">
@@ -160,32 +163,54 @@ export function PdfViewer({
                   ))}
                 </div>
               )}
+              <div className="number-highlight-layer">
+                {pageNumberHighlights.map((highlight) => (
+                  <span key={`number-${highlight.tokenId}`} className="number-highlight" style={position(highlight.rect, rendered.bounds)} />
+                ))}
+              </div>
               <div className="highlight-layer">
                 {pageHighlights.map((highlight) => {
                   const target = highlightSide === "newer" ? highlight.newer : highlight.older;
                   if (!target) return null;
                   const isActive = activeHighlight === highlight.id;
                   return (
-                    <button
-                      key={`${highlightSide}-${highlight.id}`}
-                      type="button"
-                      className={`pdf-highlight ${highlight.status} ${isActive ? "active" : ""}`}
-                      style={position(target.rect, rendered.bounds)}
-                      onMouseEnter={() => onHighlight?.(highlight.id)}
-                      onMouseLeave={() => onHighlight?.(null)}
-                      onFocus={() => onHighlight?.(highlight.id)}
-                      onBlur={() => onHighlight?.(null)}
-                      onClick={() => onHighlightActivate?.(highlight)}
-                      aria-label={highlight.explanation}
-                    >
-                      <span className="highlight-tooltip">
-                        <strong>{highlight.labelNew}</strong>
-                        <span>{highlight.explanation}</span>
-                        <small>
-                          {highlight.matchMethod === "model" ? "Model-assisted label match" : `${highlight.matchMethod} label match`}
-                        </small>
-                      </span>
-                    </button>
+                    <Fragment key={`${highlightSide}-${highlight.id}`}>
+                      {target.keyRect && (
+                        <span
+                          className={`pdf-context-highlight key ${highlight.status} ${isActive ? "active" : ""}`}
+                          style={position(target.keyRect, rendered.bounds)}
+                          aria-hidden="true"
+                        />
+                      )}
+                      {target.yearRect && (
+                        <span
+                          className={`pdf-context-highlight year ${highlight.status} ${isActive ? "active" : ""}`}
+                          style={position(target.yearRect, rendered.bounds)}
+                          aria-hidden="true"
+                        />
+                      )}
+                      <button
+                        type="button"
+                        className={`pdf-highlight number ${highlight.status} ${isActive ? "active" : ""}`}
+                        style={position(target.rect, rendered.bounds)}
+                        onMouseEnter={() => onHighlight?.(highlight.id)}
+                        onMouseLeave={() => onHighlight?.(null)}
+                        onFocus={() => onHighlight?.(highlight.id)}
+                        onBlur={() => onHighlight?.(null)}
+                        onClick={() => onHighlightActivate?.(highlight)}
+                        aria-label={highlight.explanation}
+                      >
+                        <span className="highlight-tooltip">
+                          <strong>{highlight.labelNew}</strong>
+                          <span>{highlight.explanation}</span>
+                          <small>
+                            {highlight.matchMethod === "model"
+                              ? "Model-assisted label match"
+                              : `${highlight.matchMethod} label match`}
+                          </small>
+                        </span>
+                      </button>
+                    </Fragment>
                   );
                 })}
               </div>

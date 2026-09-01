@@ -178,11 +178,11 @@ export function AnalyzeWorkspace() {
           setProgressLabel(label);
         },
         resolveLabels: isConfigured
-          ? (labelsNew, labelsOld) =>
-              callModel("match-labels", { labelsNew, labelsOld }) as Promise<{
+          ? (newerRows, olderRows) =>
+              callModel("match-labels", { newerRows, olderRows }) as Promise<{
                 mappings: Array<{
-                  labelNew: string;
-                  labelsOld: string[];
+                  newerId: string;
+                  olderIds: string[];
                   relationship: "direct" | "aggregate" | "none";
                 }>;
               }>
@@ -340,6 +340,7 @@ export function AnalyzeWorkspace() {
                 page={newerPage}
                 onPageChange={setNewerPage}
                 highlights={analysis?.discrepancies}
+                numberHighlights={analysis?.numberHighlights.newer}
                 highlightSide="newer"
                 activeHighlight={activeHighlight}
                 onHighlight={setHoveredHighlight}
@@ -364,6 +365,7 @@ export function AnalyzeWorkspace() {
                 page={olderPage}
                 onPageChange={setOlderPage}
                 highlights={analysis?.discrepancies}
+                numberHighlights={analysis?.numberHighlights.older}
                 highlightSide="older"
                 activeHighlight={activeHighlight}
                 onHighlight={setHoveredHighlight}
