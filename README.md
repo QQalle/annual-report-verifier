@@ -114,25 +114,6 @@ data, never as instructions.
 
 The response is constrained to JSON mappings with exact supplied occurrence IDs and a `direct`, `aggregate`, or `none` relationship. The app rejects invalid IDs, cross-year mappings, reused rows, malformed groups, aggregates that are not exact deterministic proposals, and any aggregate whose numeric totals do not agree. A model-assisted unequal rename stays gray unless the deterministic matcher also establishes a unique exact-label, same-context counterpart. The separate scrambling request asks for one safe Swedish synonym in the original grammatical form and returns the original word if none is safe.
 
-## Recorded verification and limitations
-
-The final live Brf Smulgubben 2024/2023 session extracted 216 prior-year cells:
-197 matches, 3 discrepancies, and 16 cells without a counterpart; 11 cells
-were model-assisted. Coverage included 48 cells across all four prior-year
-columns in `Flerårsöversikt`, comparative statement columns, and text-layer
-tables in the notes.
-
-The larger HMS Networks 2023/2022 session extracted 382 cells: 167 matches, 8
-discrepancies, and 207 cells without a counterpart; 49 cells were
-model-assisted. The high gray count is consistent with the conservative
-policy: missing, ambiguous, structurally changed, or weakly aligned rows are
-not promoted to discrepancies for coverage.
-
-- Scanned PDFs need OCR and are not supported yet.
-- The recorded live runs used OpenAI models. Anthropic orchestration is covered by deterministic response stubs, but this repository does not claim a live Anthropic verification pass.
-- Complex tables with floating labels, charts, damaged glyphs, or non-year column headers may be gray.
-- PDF support is powered by `mupdf` (AGPL-3.0); review that license before distributing a modified hosted version.
-
 ## What I would do next
 
 - Add a sanitized golden extraction fixture derived from the supplied Smulgubben reports so the complete 216-cell result can run in CI without distributing the source PDFs.
