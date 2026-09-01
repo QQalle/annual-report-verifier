@@ -341,7 +341,10 @@ test("semantic matching prompt explicitly treats residual labels as contextual",
   const definition = requestDefinition("match-labels", { newerRows: [], olderRows: [] });
   assert.match(definition.system || "", /Residual labels such as “Övrigt”/);
   assert.match(definition.system || "", /note title and neighboring stable rows/);
-  assert.match(definition.system || "", /Never match two residual rows merely because/);
+  assert.match(definition.system || "", /Never match residual rows solely/);
+  assert.match(definition.system || "", /Wording similarity alone is insufficient/);
+  assert.match(definition.system || "", /Never create, extend, remove from, or recombine/);
+  assert.match(definition.system || "", /Prefer none over a speculative mapping/);
 });
 
 test("model-assisted split rows are checked arithmetically and grouped", async () => {
@@ -353,13 +356,14 @@ test("model-assisted split rows are checked arithmetically and grouped", async (
     { label: "Reparationer totalt", values: [100, 90] },
   ], { title: "NOT 5, REPARATIONER" })];
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
-    resolveLabels: async (newerRows, olderRows) => ({
-      mappings: [{
-        newerIds: newerRows.map((row) => row.id),
-        olderIds: [olderRows[0].id],
-        relationship: "aggregate",
-      }],
-    }),
+    resolveLabels: async (newerRows, olderRows, proposedGroups) => {
+      const proposal = proposedGroups.find((group) =>
+        group.newerIds.length === newerRows.length && group.olderIds.length === 1,
+      );
+      assert.ok(proposal, "the deterministic split proposal is supplied to the model");
+      assert.equal(proposal.olderIds[0], olderRows[0].id);
+      return { mappings: [proposal] };
+    },
   });
   assert.equal(result.discrepancies.length, 1);
   assert.equal(result.discrepancies[0].status, "match");
@@ -389,6 +393,82 @@ test("model-assisted merged rows also sum multiple prior-report keys", async () 
   assert.equal(result.discrepancies[0].status, "match");
   assert.equal(result.discrepancies[0].arithmetic?.expression, "100 = 40 + 60");
   assert.equal(result.discrepancies[0].olderRelated?.length, 1);
+});
+
+test("model cannot invent an aggregate that was not deterministically proposed", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Samlad kostnad", values: [125, 100] },
+  ], { title: "NOT 5, KOSTNADER" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Tjänster", values: [60, 55] },
+    { label: "Material", values: [30, 25] },
+  ], { title: "NOT 5, KOSTNADER" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows, proposedGroups) => {
+      assert.equal(proposedGroups.length, 0);
+      return {
+        mappings: [{
+          newerIds: [newerRows[0].id],
+          olderIds: olderRows.map((row) => row.id),
+          relationship: "aggregate",
+        }],
+      };
+    },
+  });
+
+  assert.equal(result.modelAssisted, 0);
+  assert.equal(result.discrepancies[0].status, "missing");
+  assert.equal(result.discrepancies[0].arithmetic, undefined);
+});
+
+test("an unequal model-assisted rename remains gray", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Leverantörstjänster", values: [140, 120] },
+  ], { title: "NOT 5, EXTERNA KOSTNADER" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Konsultarvoden", values: [100, 90] },
+  ], { title: "NOT 5, EXTERNA KOSTNADER" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => ({
+      mappings: [{
+        newerIds: [newerRows[0].id],
+        olderIds: [olderRows[0].id],
+        relationship: "direct",
+      }],
+    }),
+  });
+
+  assert.equal(result.modelAssisted, 1);
+  assert.equal(result.discrepancies[0].status, "missing");
+  assert.equal(result.discrepancies[0].matchMethod, "model");
+  assert.match(result.discrepancies[0].explanation, /exact-label deterministic alignment/);
+});
+
+test("a model rename cannot override a unique exact-label discrepancy", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Revisionsarvoden", values: [140, 120] },
+  ], { title: "NOT 5, EXTERNA KOSTNADER" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Revisionsarvoden", values: [100, 90] },
+    { label: "Revisionstjänster", values: [120, 100] },
+  ], { title: "NOT 5, EXTERNA KOSTNADER" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => ({
+      mappings: [{
+        newerIds: [newerRows[0].id],
+        olderIds: [olderRows.find((row) => row.label === "Revisionstjänster")!.id],
+        relationship: "direct",
+      }],
+    }),
+  });
+
+  assert.equal(result.modelAssisted, 0);
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].labelOld, "Revisionsarvoden");
+  assert.equal(result.discrepancies[0].matchMethod, "exact");
 });
 
 test("deterministic proposals surface a broader key plus folded-in prior rows", async () => {

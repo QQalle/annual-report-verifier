@@ -552,8 +552,10 @@ function buildArithmeticProposals(
         const group = anchor ? [anchor, ...selected] : selected;
         const total = group.reduce((sum, candidate) => sum + candidate.value, 0);
         if (!arithmeticEqual(cell.value, total)) continue;
-        const olderIds = group.map((candidate) => candidate.id);
-        const signature = `${cell.id}:${[...olderIds].sort().join(":")}`;
+        const olderIds = [...group]
+          .sort((a, b) => a.page - b.page || a.token.rect[1] - b.token.rect[1])
+          .map((candidate) => candidate.id);
+        const signature = mappingSignature([cell.id], olderIds);
         if (seen.has(signature)) continue;
         seen.add(signature);
         proposals.push({ newerIds: [cell.id], olderIds, relationship: "aggregate" });
@@ -563,7 +565,51 @@ function buildArithmeticProposals(
       if (proposalsForCell >= 6 || proposals.length >= 80) break;
     }
   }
+
+  // Search the inverse direction as well: several rows in the newer report may
+  // have replaced one combined row in the older report. These groups are still
+  // bounded and proven numerically before the model sees their IDs.
+  for (const older of olderCandidates) {
+    if (proposals.length >= 80) break;
+    if (protectedOlderIds.has(older.id) || older.value === 0) continue;
+    const pool = unresolved
+      .map(({ cell }) => cell)
+      .filter((cell) =>
+        cell.year === older.year &&
+        cell.value !== 0 &&
+        labelSimilarity(normalizeLabel(cell.tableTitle), normalizeLabel(older.tableTitle)) >= 0.65 &&
+        Math.abs(cell.relativePage - older.relativePage) < 0.2,
+      )
+      .sort((a, b) =>
+        labelSimilarity(b.normalizedLabel, older.normalizedLabel) -
+          labelSimilarity(a.normalizedLabel, older.normalizedLabel) ||
+        Math.abs(a.relativePage - older.relativePage) - Math.abs(b.relativePage - older.relativePage),
+      )
+      .slice(0, 14);
+    let proposalsForCell = 0;
+
+    for (let size = 2; size <= 4; size += 1) {
+      for (const selected of subsetsOfSize(pool, size, 1500)) {
+        const total = selected.reduce((sum, candidate) => sum + candidate.value, 0);
+        if (!arithmeticEqual(total, older.value)) continue;
+        const newerIds = [...selected]
+          .sort((a, b) => a.page - b.page || a.token.rect[1] - b.token.rect[1])
+          .map((candidate) => candidate.id);
+        const signature = mappingSignature(newerIds, [older.id]);
+        if (seen.has(signature)) continue;
+        seen.add(signature);
+        proposals.push({ newerIds, olderIds: [older.id], relationship: "aggregate" });
+        proposalsForCell += 1;
+        if (proposalsForCell >= 6 || proposals.length >= 80) break;
+      }
+      if (proposalsForCell >= 6 || proposals.length >= 80) break;
+    }
+  }
   return proposals;
+}
+
+function mappingSignature(newerIds: string[], olderIds: string[]) {
+  return `${[...newerIds].sort().join(":")}=>${[...olderIds].sort().join(":")}`;
 }
 
 function buildSectionJumps(
@@ -633,6 +679,11 @@ export async function analyzePair(
       .filter((item) => item.match?.equal && !item.match.ambiguous)
       .map((item) => item.match!.candidate.id),
   );
+  const confidentMismatchNewerIds = new Set(
+    preliminary
+      .filter((item) => item.match?.confidentMismatch)
+      .map((item) => item.cell.id),
+  );
   const mappings: ModelMapping[] = [];
 
   if (unresolved.length && options?.resolveLabels) {
@@ -684,6 +735,9 @@ export async function analyzePair(
         const response = await options.resolveLabels(newerRows, olderRows, proposedGroups);
         const validNewerIds = new Set(newerRows.map((row) => row.id));
         const validOlderIds = new Set(olderRows.map((row) => row.id));
+        const proposedSignatures = new Set(
+          proposedGroups.map((group) => mappingSignature(group.newerIds, group.olderIds)),
+        );
         for (const mapping of response.mappings || []) {
           const mappedNewerIds = [...new Set((mapping.newerIds || []).map(String))];
           const mappedOlderIds = [...new Set((mapping.olderIds || []).map(String))];
@@ -700,7 +754,25 @@ export async function analyzePair(
             ...mappedNewerIds.map((id) => newerById.get(id)?.year),
             ...mappedOlderIds.map((id) => olderById.get(id)?.year),
           ]);
-          if (!validRelationship || !validTargets || !unusedTargets || groupYears.size !== 1) continue;
+          const isApprovedProposal = mapping.relationship !== "aggregate" || proposedSignatures.has(
+            mappingSignature(mappedNewerIds, mappedOlderIds),
+          );
+          const arithmeticAgrees = mapping.relationship !== "aggregate" || arithmeticEqual(
+            mappedNewerIds.reduce((sum, id) => sum + (newerById.get(id)?.value || 0), 0),
+            mappedOlderIds.reduce((sum, id) => sum + (olderById.get(id)?.value || 0), 0),
+          );
+          const preservesDeterministicMismatch = mapping.relationship !== "direct" || mappedNewerIds.every(
+            (id) => !confidentMismatchNewerIds.has(id),
+          );
+          if (
+            !validRelationship ||
+            !validTargets ||
+            !unusedTargets ||
+            groupYears.size !== 1 ||
+            !isApprovedProposal ||
+            !arithmeticAgrees ||
+            !preservesDeterministicMismatch
+          ) continue;
           mappedNewerIds.forEach((id) => usedNewer.add(id));
           mappedOlderIds.forEach((id) => usedOlder.add(id));
           mappings.push({ ...mapping, newerIds: mappedNewerIds, olderIds: mappedOlderIds });
@@ -744,7 +816,9 @@ export async function analyzePair(
         const operator = equal ? "=" : "≠";
         discrepancies.push({
           id: `comparison-model-${mapping.newerIds.join("-")}`,
-          status: equal ? "match" : "mismatch",
+          // A model-assisted rename is useful alignment evidence, but only a
+          // unique exact-label deterministic match may become a red mismatch.
+          status: equal ? "match" : "missing",
           year: newerGroup[0].year,
           section: newerGroup[0].section,
           labelNew: newerGroup.map((item) => item.label).join(" + "),
@@ -754,7 +828,9 @@ export async function analyzePair(
           matchMethod: "model",
           explanation: isArithmetic
             ? `${newerGroup[0].year}: ${newerExpression} ${operator} ${olderExpression}. The model identified a semantically coherent split/merge; the totals were checked deterministically.`
-            : describe(equal ? "match" : "mismatch", newerGroup[0], olderGroup[0], olderExpression),
+            : equal
+              ? describe("match", newerGroup[0], olderGroup[0], olderExpression)
+              : `${newerGroup[0].year}: the model found a possible renamed counterpart, but unequal values require an exact-label deterministic alignment before a discrepancy can be flagged.`,
           newer: evidence(newerGroup[0]),
           older: evidence(olderGroup[0]),
           newerRelated: newerGroup.slice(1).map(evidence),
