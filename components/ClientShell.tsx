@@ -25,6 +25,7 @@ function Shell({ children }: { children: ReactNode }) {
             Analyze
           </Link>
         </nav>
+        <h1 className="product-title">Second Pass</h1>
         <div className="topbar-spacer" />
         <button
           className="sidebar-toggle"

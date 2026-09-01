@@ -64,6 +64,20 @@ export type ReportPair = {
 
 export type DiscrepancyStatus = "match" | "mismatch" | "missing";
 
+export type EvidenceTarget = {
+  page: number;
+  rect: Rect;
+  tokenId: string;
+  keyRect?: Rect;
+  yearRect?: Rect;
+};
+
+export type ArithmeticCheck = {
+  expression: string;
+  newerTerms: Array<{ label: string; value: string }>;
+  olderTerms: Array<{ label: string; value: string }>;
+};
+
 export type Discrepancy = {
   id: string;
   status: DiscrepancyStatus;
@@ -75,8 +89,11 @@ export type Discrepancy = {
   valueOld?: string;
   matchMethod: "exact" | "similar" | "model" | "none";
   explanation: string;
-  newer: { page: number; rect: Rect; tokenId: string; keyRect?: Rect; yearRect?: Rect };
-  older?: { page: number; rect: Rect; tokenId: string; keyRect?: Rect; yearRect?: Rect };
+  newer: EvidenceTarget;
+  older?: EvidenceTarget;
+  newerRelated?: EvidenceTarget[];
+  olderRelated?: EvidenceTarget[];
+  arithmetic?: ArithmeticCheck;
 };
 
 export type NumberHighlight = { page: number; rect: Rect; tokenId: string };

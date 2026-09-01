@@ -6,16 +6,18 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleDashed,
+  Link2,
   LoaderCircle,
   ScanSearch,
   UploadCloud,
+  Unlink2,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useModel } from "@/lib/model-context";
 import { analyzePair } from "@/lib/compare";
 import { BrowserPdf, detectReportYear } from "@/lib/pdf-engine";
-import type { AnalysisResult, Discrepancy } from "@/lib/types";
+import type { AnalysisResult, Discrepancy, EvidenceTarget } from "@/lib/types";
 import { PdfViewer } from "./PdfViewer";
 
 type Side = "newer" | "older";
@@ -103,9 +105,20 @@ export function AnalyzeWorkspace() {
   const [hoveredHighlight, setHoveredHighlight] = useState<string | null>(null);
   const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
   const [issueMode, setIssueMode] = useState<"mismatch" | "all">("mismatch");
+  const [syncEnabled, setSyncEnabled] = useState(true);
+  const [syncRequest, setSyncRequest] = useState<{
+    id: number;
+    targetSide: Side;
+    progress: number;
+  } | null>(null);
+  const [focusRequests, setFocusRequests] = useState<Record<Side, { id: number; target: EvidenceTarget } | null>>({
+    newer: null,
+    older: null,
+  });
   const { isConfigured, callModel, provider } = useModel();
   const newerRef = useRef<BrowserPdf | null>(null);
   const olderRef = useRef<BrowserPdf | null>(null);
+  const interactionId = useRef(0);
 
   useEffect(() => () => {
     newerRef.current?.destroy();
@@ -159,10 +172,30 @@ export function AnalyzeWorkspace() {
       ? "Reports must cover adjacent years, with the newer report on the left."
       : null;
 
-  const focusDiscrepancy = (item: Discrepancy) => {
+  const focusDiscrepancy = (
+    item: Discrepancy,
+    clicked?: { side: Side; target: EvidenceTarget },
+  ) => {
     setSelectedIssueId(item.id);
-    setNewerPage(item.newer.page);
-    if (item.older) setOlderPage(item.older.page);
+    setSyncEnabled(true);
+    const newerTarget = clicked?.side === "newer" ? clicked.target : item.newer;
+    const olderTarget = clicked?.side === "older" ? clicked.target : item.older;
+    setNewerPage(newerTarget.page);
+    if (olderTarget) setOlderPage(olderTarget.page);
+    const id = ++interactionId.current;
+    setFocusRequests({
+      newer: { id, target: newerTarget },
+      older: olderTarget ? { id, target: olderTarget } : null,
+    });
+  };
+
+  const syncViewport = (source: Side, position: { progress: number }) => {
+    if (!syncEnabled) return;
+    setSyncRequest({
+      id: ++interactionId.current,
+      targetSide: source === "newer" ? "older" : "newer",
+      progress: position.progress,
+    });
   };
 
   const runAnalysis = async () => {
@@ -178,10 +211,10 @@ export function AnalyzeWorkspace() {
           setProgressLabel(label);
         },
         resolveLabels: isConfigured
-          ? (newerRows, olderRows) =>
-              callModel("match-labels", { newerRows, olderRows }) as Promise<{
+          ? (newerRows, olderRows, proposedGroups) =>
+              callModel("match-labels", { newerRows, olderRows, proposedGroups }) as Promise<{
                 mappings: Array<{
-                  newerId: string;
+                  newerIds: string[];
                   olderIds: string[];
                   relationship: "direct" | "aggregate" | "none";
                 }>;
@@ -233,15 +266,28 @@ export function AnalyzeWorkspace() {
           <h1>Analyze annual reports</h1>
           <p>Compare prior-year figures against what the previous report actually stated.</p>
         </div>
-        <button
-          className="button primary analyze-button"
-          type="button"
-          onClick={runAnalysis}
-          disabled={!newerPdf || !olderPdf || !newerYear || !olderYear || Boolean(yearError) || analyzing}
-        >
-          {analyzing ? <LoaderCircle size={15} className="spin" /> : <ScanSearch size={15} />}
-          {analyzing ? "Analyzing…" : "Analyze"}
-        </button>
+        <div className="analyze-actions">
+          <button
+            className={`button secondary sync-toggle ${syncEnabled ? "active" : ""}`}
+            type="button"
+            onClick={() => setSyncEnabled((enabled) => !enabled)}
+            disabled={!newerPdf || !olderPdf}
+            aria-pressed={syncEnabled}
+            title={syncEnabled ? "Stop synchronizing PDF scrolling" : "Synchronize PDF scrolling"}
+          >
+            {syncEnabled ? <Link2 size={14} /> : <Unlink2 size={14} />}
+            {syncEnabled ? "Synced" : "Sync"}
+          </button>
+          <button
+            className="button primary analyze-button"
+            type="button"
+            onClick={runAnalysis}
+            disabled={!newerPdf || !olderPdf || !newerYear || !olderYear || Boolean(yearError) || analyzing}
+          >
+            {analyzing ? <LoaderCircle size={15} className="spin" /> : <ScanSearch size={15} />}
+            {analyzing ? "Analyzing…" : "Analyze"}
+          </button>
+        </div>
       </header>
 
       {(yearError || error) && (
@@ -344,7 +390,10 @@ export function AnalyzeWorkspace() {
                 highlightSide="newer"
                 activeHighlight={activeHighlight}
                 onHighlight={setHoveredHighlight}
-                onHighlightActivate={focusDiscrepancy}
+                onHighlightActivate={(item, target) => focusDiscrepancy(item, { side: "newer", target })}
+                focusRequest={focusRequests.newer}
+                syncRequest={syncRequest?.targetSide === "newer" ? syncRequest : null}
+                onViewportChange={(position) => syncViewport("newer", position)}
               />
             </>
           )}
@@ -369,7 +418,10 @@ export function AnalyzeWorkspace() {
                 highlightSide="older"
                 activeHighlight={activeHighlight}
                 onHighlight={setHoveredHighlight}
-                onHighlightActivate={focusDiscrepancy}
+                onHighlightActivate={(item, target) => focusDiscrepancy(item, { side: "older", target })}
+                focusRequest={focusRequests.older}
+                syncRequest={syncRequest?.targetSide === "older" ? syncRequest : null}
+                onViewportChange={(position) => syncViewport("older", position)}
               />
             </>
           )}

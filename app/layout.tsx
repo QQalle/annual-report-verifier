@@ -15,8 +15,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: {
-    default: "Annual report verification",
-    template: "%s · Annual report verification",
+    default: "Second Pass",
+    template: "%s · Second Pass",
   },
   description:
     "Inspect, scramble, and verify adjacent-year annual reports with coordinate-linked evidence.",

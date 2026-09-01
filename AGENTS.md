@@ -19,9 +19,16 @@ unrelated document tooling unless the product scope is explicitly expanded.
 - Keep uploaded documents local to the browser wherever possible.
 - Treat adjacent years as a hard validation rule, with a clear manual override
   only when metadata extraction is uncertain.
-- A missing or ambiguous counterpart is gray, never red.
+- False positives are more harmful than false negatives. A missing, ambiguous,
+  weakly extracted, or weakly aligned counterpart is gray, never red.
+- Red requires a unique, exact-label, same-context counterpart with a
+  deterministic unequal value. Do not loosen this threshold for coverage.
 - OpenAI or Anthropic may propose Swedish synonyms and semantic label mappings. The model must not
   decide numeric equality or fabricate source values.
+- Arithmetic is deterministic: enumerate bounded same-year split/merge terms,
+  verify exact totals, then let the model approve or reject semantic coherence
+  from labels, note heading, and nearby rows. Approved arithmetic is blue;
+  unresolved groups stay gray.
 - Every model request and structured response must be visible in the audit
   sidebar together with token usage. Never log or redisplay the full API key.
 
@@ -51,6 +58,11 @@ unrelated document tooling unless the product scope is explicitly expanded.
   components in separate modules.
 - Use deterministic normalization and matching before any model call.
 - Validate all model output before applying it.
+- Send enough table context for semantic matching: section, table title, page,
+  nearby labels, and occurrence IDs. Treat residual keys such as "Övrigt" as
+  contextual categories, never as a direct semantic match by name alone.
+- Process unresolved rows in bounded batches; never silently omit later pages
+  because an earlier batch was full.
 - Keep secrets server-side or in ephemeral request state; never commit keys or
   store them in browser persistence.
 - Preserve the starter's package manager and Cloudflare-compatible build.

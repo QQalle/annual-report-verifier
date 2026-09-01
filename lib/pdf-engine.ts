@@ -83,6 +83,29 @@ function mergeNumberFragments(tokens: PdfToken[]): PdfToken[] {
   return merged;
 }
 
+export function mergeTextFragments(tokens: PdfToken[]): PdfToken[] {
+  const merged: PdfToken[] = [];
+  for (const token of tokens) {
+    const previous = merged.at(-1);
+    const gap = previous ? token.rect[0] - previous.rect[2] : Infinity;
+    if (
+      previous &&
+      !previous.isNumber &&
+      !token.isNumber &&
+      // Some PDFs encode kerning as whitespace between overlapping glyph runs.
+      // Join only touching runs: ordinary word spacing in these reports is ~2pt.
+      gap <= 0.5
+    ) {
+      previous.text += token.text;
+      previous.rect = unionRect(previous.rect, token.rect);
+      previous.fontSize = Math.max(previous.fontSize, token.fontSize);
+      continue;
+    }
+    merged.push({ ...token });
+  }
+  return merged;
+}
+
 function clusterVisualRows(rawLines: PdfLine[], pageIndex: number): PdfLine[] {
   const groups: Array<{ center: number; lines: PdfLine[] }> = [];
   const sorted = [...rawLines].sort(
@@ -99,7 +122,9 @@ function clusterVisualRows(rawLines: PdfLine[], pageIndex: number): PdfLine[] {
     }
   }
   return groups.map((group, index) => {
-    const tokens = group.lines.flatMap((line) => line.tokens).sort((a, b) => a.rect[0] - b.rect[0]);
+    const tokens = mergeTextFragments(
+      group.lines.flatMap((line) => line.tokens).sort((a, b) => a.rect[0] - b.rect[0]),
+    );
     const id = `p${pageIndex}-r${index}`;
     for (const token of tokens) token.lineId = id;
     return {

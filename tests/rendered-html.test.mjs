@@ -19,7 +19,7 @@ test("server-renders the report library", async () => {
   const html = await response.text();
   assert.match(html, /Report library/);
   assert.match(html, /Upload your own pair/);
-  assert.match(html, /Annual report verification/);
+  assert.match(html, /Second Pass/);
   assert.match(html, /Model setup/);
 });
 
