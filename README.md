@@ -25,7 +25,7 @@ npm run start
 `/analyze` is the primary workflow. Drop one newer and one prior report into the two viewers, or send a catalogue pair directly from `/library`. The app detects the report years, labels manual year corrections, enforces adjacency, compares overlapping prior-year figures, and links every result to both PDF locations.
 
 - Exact and high-confidence equal comparisons are green. Model-approved split/merge comparisons are blue and show their equation in the tooltip.
-- Red requires a one-to-one, unique, exact normalized label in the exact same table context with a deterministically unequal value. A repeated or reused occurrence cannot be red.
+- Red requires a one-to-one, unique, exact normalized label in a real, stable table context with a deterministically unequal value. A glyph-corrupted label may count as exact only when each replacement glyph is a bounded wildcard and the full label aligns uniquely; ordinary fuzzy or semantic similarity cannot produce red. Generic fallback titles such as `Financial table`, repeated/reused occurrences, and cross-table alignments cannot be red.
 - Missing, ambiguous, weakly extracted, renamed, cross-table, or multiply claimed counterparts are gray. Gray reasons are kept distinct in the evidence panel; false positives are treated as more harmful than false negatives.
 - Both PDFs scroll continuously. They can be kept synced or desynced, clicking a finding resyncs at that location, and red marks on the scrollbar show discrepancies.
 - A persistent finding panel shows both labels, both source values, normalized numeric evidence, pages, alignment strength, uniqueness, arithmetic, model involvement, and the reason for the verdict. Use J/K to move through the active queue and mark findings reviewed without changing their verdict.
@@ -62,10 +62,11 @@ The selected model never decides whether two numbers are equal. The numeric comp
 
 ## Token spend
 
-Two final live OpenAI verification runs used **170,265 tokens** in total:
-151,181 input and 19,084 output tokens across 11 calls. The Smulgubben run used
-22,312 tokens, while the larger HMS Networks run used 147,953. Approximately
-**USD 0.50 was spent on model API usage during development**.
+Recorded live OpenAI verification and acceptance runs used **281,778 tokens**
+in total: 247,859 input and 33,919 output tokens across 19 calls. This includes
+three command-line tuning runs and the final browser acceptance run for the
+Smulgubben pair, which converged on 198 green, two blue, one red, and 15 gray
+comparisons.
 
 See [TOKEN_SPEND.md](TOKEN_SPEND.md) for the per-case breakdown, the matching
 session snapshots, and the limits of interpreting token counts as cost. The
@@ -78,7 +79,7 @@ MuPDF reads each page's text and character coordinates in the same structured-te
 
 The analyzer:
 
-1. detects table header years and assigns numeric cells to the nearest year column;
+1. detects table header years and assigns numeric cells to the closest preceding header band, using a below-row band only when no preceding header exists;
 2. recognizes date-formatted headers and consecutive multi-year bands, including `NYCKELTAL` tables;
 3. excludes the newer report's current-year values;
 4. normalizes labels, note prefixes, units, Swedish separators, decimal commas, negatives, and English comma thousands;
@@ -98,7 +99,7 @@ The analyzer never asks a model to do the arithmetic. For each unresolved value 
 
 It protects prior rows already used by an unambiguous equal match, limits candidate combinations, and checks equality with deterministic numeric parsing. Only then does it show the candidate group to the model without its values. The model may approve the grouping only if the labels, note heading, and neighboring rows make the regrouping semantically coherent. The UI shows approved arithmetic comparisons in blue with the equation and all linked values in the tooltip. Unapproved or ambiguous proposals remain gray.
 
-Unresolved rows are reviewed in batches of at most 20. Forward aggregate proposals are capped per row before the request-wide cap is used, so early rows cannot consume the proposal budget and silently starve later pages. Batch number, failures, accepted mappings, and rejected mappings are observable; deterministic output remains usable if a batch fails.
+Unresolved rows are reviewed in batches of at most 20. Arithmetic proposals are discovered before the bounded model-candidate list is assembled; every member of a retained exact proposal is reserved, and the remaining candidate budget is filled round-robin across unresolved rows. This prevents early rows from silently starving later pages. Batch number, failures, accepted mappings, and rejected mappings are observable; deterministic output remains usable if a batch fails.
 
 ## LLM validation prompts
 

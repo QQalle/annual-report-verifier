@@ -202,6 +202,42 @@ test("recognizes a multi-year NYCKELTAL header and compares the whole page", asy
   assert.deepEqual([...new Set(result.discrepancies.map((item) => item.section))], ["Multi-year overview"]);
 });
 
+test("a unique damaged-glyph label can still prove an exact deterministic discrepancy", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Årsavgift per kvm upplåten bostadsrätt, kr", values: [700, 693] },
+  ], { title: "FLERÅRSÖVERSIKT" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Årsavgi� per kvm upplåten bostadsrä�, kr", values: [692, 680] },
+  ], { title: "FLERÅRSÖVERSIKT" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].evidence.reason, "exact-unequal");
+  assert.equal(result.discrepancies[0].evidence.labelAlignment, "damaged-text");
+});
+
+test("model confirmation cannot downgrade a damaged-glyph deterministic discrepancy", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Årsavgift per kvm upplåten bostadsrätt, kr", values: [700, 693] },
+  ], { title: "FLERÅRSÖVERSIKT" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Årsavgi� per kvm upplåten bostadsrä�, kr", values: [692, 680] },
+  ], { title: "FLERÅRSÖVERSIKT" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => ({
+      mappings: [{
+        newerIds: [newerRows[0].id],
+        olderIds: [olderRows[0].id],
+        relationship: "direct",
+      }],
+    }),
+  });
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].evidence.reason, "exact-unequal");
+  assert.equal(result.discrepancies[0].evidence.labelAlignment, "damaged-text");
+});
+
 test("compares and labels every opening balance in changes in equity", async () => {
   const newer = [reportPage(0, ["2023-12-31", "2024-12-31"], [
     { label: "Insatser", values: [72134, 72134] },
@@ -392,8 +428,8 @@ test("unequal duplicate rows stay gray when their alignment is uncertain", async
 });
 
 test("a unique exact row with unequal values is a discrepancy", async () => {
-  const newer = [reportPage(0, [2025, 2024], [{ label: "Nettoomsättning", values: [130, 101] }])];
-  const older = [reportPage(0, [2024, 2023], [{ label: "Nettoomsättning", values: [100, 80] }])];
+  const newer = [reportPage(0, [2025, 2024], [{ label: "Nettoomsättning", values: [130, 101] }], { title: "NOT 2, INTÄKTER" })];
+  const older = [reportPage(0, [2024, 2023], [{ label: "Nettoomsättning", values: [100, 80] }], { title: "NOT 2, INTÄKTER" })];
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
   assert.equal(result.discrepancies[0].status, "mismatch");
   assert.equal(result.discrepancies[0].evidence.reason, "exact-unequal");
@@ -406,6 +442,19 @@ test("an exact label in a different table context cannot become red", async () =
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
   assert.equal(result.discrepancies[0].status, "missing");
   assert.equal(result.discrepancies[0].evidence.verdict, "review");
+});
+
+test("a generic fallback table title is insufficient context for red", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Ingående anskaffningsvärde", values: [300, 272] },
+  ])];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Ingående anskaffningsvärde", values: [59, 0] },
+  ])];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.equal(result.discrepancies[0].status, "missing");
+  assert.equal(result.discrepancies[0].evidence.contextAlignment, "compatible");
 });
 
 test("one prior occurrence cannot verify two newer rows", async () => {
@@ -717,6 +766,39 @@ test("deterministic proposals surface a broader key plus folded-in prior rows", 
   assert.equal(grouped?.status, "match");
   assert.equal(grouped?.arithmetic?.expression, "68908 = 59645 + 2465 + 6798");
   assert.equal(grouped?.olderRelated?.length, 2);
+});
+
+test("arithmetic proposals reserve their rows beyond the global model-candidate cap", async () => {
+  const newer = Array.from({ length: 10 }, (_, page) =>
+    reportPage(page, [2024, 2023], page === 9
+      ? [{ label: "Övriga förvaltningskostnader", values: [70000, 68908] }]
+      : [{ label: `Ny rad ${page}`, values: [90000 + page, 80000 + page] }],
+    { title: `NOT ${page + 1}, KOSTNADER` }));
+  const older = Array.from({ length: 10 }, (_, page) =>
+    reportPage(page, [2023, 2022], page === 9
+      ? [
+          { label: "Övriga förvaltningskostnader", values: [59645, 50099] },
+          { label: "Trivselåtgärder", values: [2465, 4200] },
+          { label: "Bankkostnader", values: [6798, 6348] },
+        ]
+      : Array.from({ length: 18 }, (__, row) => ({
+          label: `Äldre rad ${page}-${row}`,
+          values: [30000 + page * 100 + row, 20000 + row] as [number, number],
+        })),
+    { title: `NOT ${page + 1}, KOSTNADER` }));
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023, {
+    resolveLabels: async (_newerRows, olderRows, proposedGroups) => {
+      const proposal = proposedGroups.find((group) => group.olderIds.length === 3);
+      assert.ok(proposal, "the late-page exact arithmetic proposal survives prompt bounding");
+      assert.ok(proposal.olderIds.every((id) => olderRows.some((row) => row.id === id)));
+      return { mappings: [proposal] };
+    },
+  });
+
+  const grouped = result.discrepancies.find((item) => item.labelNew === "Övriga förvaltningskostnader");
+  assert.equal(grouped?.status, "match");
+  assert.equal(grouped?.arithmetic?.expression, "68908 = 59645 + 2465 + 6798");
 });
 
 test("an approved aggregate takes precedence over a competing direct anchor mapping", async () => {

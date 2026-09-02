@@ -1,9 +1,9 @@
 # Token spend
 
-This page records the model usage from the two final live analysis cases. The
-figures come from the in-app **Session usage** and **API calls** audit views in
-the supplied verification screenshots. They are a snapshot of those browser
-sessions, not a forecast or a fixed per-report allowance.
+This page records the measured model usage from the live analysis cases and the
+September 2026 Smulgubben acceptance tuning. The figures come from provider
+usage returned by the model endpoint and the in-app **Session usage** audit.
+They are development snapshots, not a forecast or a fixed per-report allowance.
 
 ## Recorded cases
 
@@ -11,22 +11,18 @@ sessions, not a forecast or a fixed per-report allowance.
 | --- | --- | ---: | ---: | ---: | ---: | --- |
 | Brf Smulgubben, 2024 compared with 2023 | OpenAI `gpt-5.6-luna` | 19,526 | 2,786 | 22,312 | 2 | 216 cells; 197 matches, 3 discrepancies, 16 without a counterpart; 11 model-assisted |
 | HMS Networks, 2023 compared with 2022 | OpenAI `gpt-5.6-sol` | 131,655 | 16,298 | 147,953 | 9 | 382 cells; 167 matches, 8 discrepancies, 207 without a counterpart; 49 model-assisted |
-| **Combined** | — | **151,181** | **19,084** | **170,265** | **11** | **598 cells; 60 model-assisted** |
+| Smulgubben acceptance tuning, three command-line runs plus final browser run | OpenAI `gpt-5.6` | 96,678 | 14,835 | 111,513 | 8 | Final run: 216 cells; 198 green, 2 blue, 1 red, 15 gray; 14 accepted mappings |
+| **Combined** | — | **247,859** | **33,919** | **281,778** | **19** | — |
 
-The API-call count includes the small connection-test request shown in each
-session. In the Smulgubben case, the semantic row-match request used 22,265
-tokens and the connection test used 47, which reconciles to the 22,312-token
-session total.
+The first two recorded cases include the small connection-test requests shown
+in their sessions. Each later acceptance run made two semantic batch calls and
+no separate connection-test call.
 
 ## Development cost
 
-Approximately **USD 0.50 was spent on model API usage during development**.
-After the recorded work, the provider account view showed **USD 4.51** in
-remaining credit.
-
-The spend is reported as the observed development total rather than allocated
-between cases. Token count alone does not determine cost: input and output can
-be priced differently, and rates vary by model and provider.
+No currency estimate is attached to the expanded total. Token count alone does
+not determine cost: input and output can be priced differently, and rates vary
+by model and provider.
 
 ## What the model was used for
 
