@@ -24,6 +24,8 @@ export type ExtractedPage = {
   text: string;
   tokens: PdfToken[];
   lines: PdfLine[];
+  /** Thin horizontal vector rules from the same PDF page content stream. */
+  horizontalRules?: Rect[];
 };
 
 export type RenderedPage = {
@@ -67,6 +69,7 @@ export type DiscrepancyStatus = "match" | "mismatch" | "missing";
 export type ReviewReason =
   | "exact-equal"
   | "damaged-text-equal"
+  | "structural-equal"
   | "model-equal"
   | "aggregate-equal"
   | "exact-unequal"
@@ -79,7 +82,7 @@ export type ReviewReason =
 export type ComparisonEvidence = {
   reason: ReviewReason;
   verdict: "verified" | "discrepancy" | "review";
-  labelAlignment: "exact" | "damaged-text" | "semantic" | "weak" | "none";
+  labelAlignment: "exact" | "damaged-text" | "structural" | "semantic" | "weak" | "none";
   contextAlignment: "same-table" | "compatible" | "weak" | "none";
   uniqueCounterpart: boolean;
   candidateCount: number;

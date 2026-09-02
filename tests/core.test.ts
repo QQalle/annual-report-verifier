@@ -137,6 +137,25 @@ function mockPdf(pages: ExtractedPage[]) {
   } as unknown as BrowserPdf;
 }
 
+function withUnlabeledRuledTotal(page: ExtractedPage, values: [number, number], y = 126) {
+  const lineId = `p${page.page}-unlabeled-total`;
+  const totalLine: PdfLine = {
+    id: lineId,
+    page: page.page,
+    text: values.join(" "),
+    rect: [300, y, 420, y + 12],
+    tokens: [
+      token(`${lineId}-v0`, page.page, String(values[0]), [300, y, 320, y + 12], true, lineId),
+      token(`${lineId}-v1`, page.page, String(values[1]), [400, y, 420, y + 12], true, lineId),
+    ],
+  };
+  page.lines.push(totalLine);
+  page.tokens.push(...totalLine.tokens);
+  page.text += `\n${totalLine.text}`;
+  page.horizontalRules = [[30, y - 3, 440, y - 2]];
+  return page;
+}
+
 test("parses annual-report number formats", () => {
   assert.equal(parseSwedishNumber("1\u202f234"), 1234);
   assert.equal(parseSwedishNumber("1,186"), 1186);
@@ -200,6 +219,49 @@ test("recognizes a multi-year NYCKELTAL header and compares the whole page", asy
   assert.equal(result.discrepancies.length, 9);
   assert.ok(result.discrepancies.every((item) => item.status === "match"));
   assert.deepEqual([...new Set(result.discrepancies.map((item) => item.section))], ["Multi-year overview"]);
+});
+
+test("a preceding year header remains associated with the end of a long table", async () => {
+  const newer = [reportPage(0, [2024, 2023], [
+    { label: "SUMMA TILLGÅNGAR", values: [64000000, 59876526] },
+  ], { title: "BALANSRÄKNING", headerY: 50, rowStart: 550 })];
+  const older = [reportPage(0, [2023, 2022], [
+    { label: "SUMMA TILLGÅNGAR", values: [59876526, 51000000] },
+  ], { title: "BALANSRÄKNING", headerY: 50, rowStart: 550 })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  const total = result.discrepancies.find((item) => item.labelNew === "SUMMA TILLGÅNGAR");
+  assert.equal(total?.status, "match");
+  assert.equal(total?.valueOld, "59876526");
+});
+
+test("a vector rule turns an otherwise unlabeled numeric row into a verifiable total", async () => {
+  const newer = [withUnlabeledRuledTotal(reportPage(0, [2024, 2023], [
+    { label: "Årets avskrivningar", values: [300, 200] },
+  ], { title: "KASSAFLÖDESANALYS" }), [500, 250])];
+  const older = [withUnlabeledRuledTotal(reportPage(0, [2023, 2022], [
+    { label: "Årets avskrivningar", values: [200, 100] },
+  ], { title: "KASSAFLÖDESANALYS" }), [250, 125])];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  const total = result.discrepancies.find((item) => item.labelNew.startsWith("Unlabeled total after"));
+  assert.equal(total?.status, "match");
+  assert.equal(total?.evidence.reason, "structural-equal");
+  assert.equal(total?.evidence.labelAlignment, "structural");
+});
+
+test("an unequal unlabeled ruled total stays gray", async () => {
+  const newer = [withUnlabeledRuledTotal(reportPage(0, [2024, 2023], [
+    { label: "Årets avskrivningar", values: [300, 250] },
+  ], { title: "KASSAFLÖDESANALYS" }), [500, 250])];
+  const older = [withUnlabeledRuledTotal(reportPage(0, [2023, 2022], [
+    { label: "Årets avskrivningar", values: [200, 100] },
+  ], { title: "KASSAFLÖDESANALYS" }), [249, 125])];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  const total = result.discrepancies.find((item) => item.labelNew.startsWith("Unlabeled total after"));
+  assert.equal(total?.status, "missing");
+  assert.notEqual(total?.evidence.verdict, "discrepancy");
 });
 
 test("a unique damaged-glyph label can still prove an exact deterministic discrepancy", async () => {
@@ -444,6 +506,28 @@ test("an exact label in a different table context cannot become red", async () =
   assert.equal(result.discrepancies[0].evidence.verdict, "review");
 });
 
+test("a uniquely equal exact occurrence can follow a note that moved by one page", async () => {
+  const newer = [
+    reportPage(0, [2025, 2024]),
+    reportPage(1, [2025, 2024], [
+      { label: "Ackumulerat anskaffningsvärde Ingående", values: [150, 100] },
+    ]),
+  ];
+  const older = [
+    reportPage(0, [2024, 2023], [
+      { label: "Ackumulerat anskaffningsvärde Ingående", values: [100, 80] },
+    ]),
+    reportPage(1, [2024, 2023], [
+      { label: "Ackumulerat anskaffningsvärde Ingående", values: [59, 40] },
+    ]),
+  ];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.equal(result.discrepancies[0].status, "match");
+  assert.equal(result.discrepancies[0].older?.page, 0);
+  assert.equal(result.discrepancies[0].valueOld, "100");
+});
+
 test("a generic fallback table title is insufficient context for red", async () => {
   const newer = [reportPage(0, [2025, 2024], [
     { label: "Ingående anskaffningsvärde", values: [300, 272] },
@@ -504,12 +588,16 @@ test("residual Övrigt labels can map to a specific renamed key using note conte
   ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
 
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
-    resolveLabels: async (newerRows, olderRows) => {
+    resolveLabels: async (newerRows, olderRows, proposedGroups) => {
       const residual = newerRows.find((row) => row.label === "Övrigt");
       const renamed = olderRows.find((row) => row.label === "Bank- och administrationskostnader");
       assert.equal(residual?.tableTitle, "NOT 9, ÖVRIGA EXTERNA KOSTNADER");
       assert.ok(residual?.nearbyRows.includes("Revisionsarvoden"));
       assert.ok(residual && renamed);
+      assert.ok(proposedGroups.some((proposal) =>
+        proposal.relationship === "direct" &&
+        proposal.newerIds[0] === residual.id &&
+        proposal.olderIds[0] === renamed.id));
       return {
         mappings: [{ newerIds: [residual.id], olderIds: [renamed.id], relationship: "direct" }],
       };
@@ -522,13 +610,42 @@ test("residual Övrigt labels can map to a specific renamed key using note conte
   assert.equal(residual?.matchMethod, "model");
 });
 
+test("an omitted equal residual proposal gets one focused semantic retry", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Övrigt", values: [130, 100] },
+    { label: "Revisionsarvoden", values: [90, 80] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Klottersanering", values: [100, 70] },
+    { label: "Revisionsarvoden", values: [80, 75] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
+  let calls = 0;
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows, proposals) => {
+      calls += 1;
+      const proposal = proposals.find((item) => item.relationship === "direct");
+      assert.ok(proposal);
+      if (calls === 1) return { mappings: [] };
+      assert.equal(newerRows.length, 1);
+      assert.equal(olderRows.length, 1);
+      return { mappings: [{ ...proposal, reason: "Same note occurrence and aligned neighboring rows." }] };
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(result.discrepancies.find((item) => item.labelNew === "Övrigt")?.status, "match");
+  assert.equal(result.modelReview.batchesAttempted, 2);
+});
+
 test("semantic matching prompt explicitly treats residual labels as contextual", () => {
   const definition = requestDefinition("match-labels", { newerRows: [], olderRows: [] });
   assert.match(definition.system || "", /Residual labels such as “Övrigt”/);
   assert.match(definition.system || "", /note title\s+and neighboring stable rows/);
   assert.match(definition.system || "", /Never match two residual rows merely because/);
   assert.match(definition.system || "", /Use direct for one-to-one equivalent concepts/);
-  assert.match(definition.system || "", /Proposed aggregate groups have already been/);
+  assert.match(definition.system || "", /proposed direct pair and aggregate group/);
+  assert.match(definition.prompt, /Deterministically equal proposals/);
   const mappingSchema = (((definition.schema.properties as Record<string, unknown>).mappings as {
     items: { required: string[] };
   }).items.required);

@@ -12,6 +12,12 @@ async function render(path) {
   );
 }
 
+test("root starts at the analyzer", async () => {
+  const response = await render("/");
+  assert.equal(response.status, 307);
+  assert.equal(new URL(response.headers.get("location"), "http://localhost").pathname, "/analyze");
+});
+
 test("server-renders the report library", async () => {
   const response = await render("/library");
   assert.equal(response.status, 200);

@@ -7,6 +7,8 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleDashed,
+  EqualNot,
+  GitCompareArrows,
   Link2,
   LoaderCircle,
   Sigma,
@@ -104,6 +106,7 @@ function YearControl({
 const reasonLabels: Record<Discrepancy["evidence"]["reason"], string> = {
   "exact-equal": "Exact row and value",
   "damaged-text-equal": "Equal despite damaged text",
+  "structural-equal": "Unlabeled ruled total and value",
   "model-equal": "Model-supported rename",
   "aggregate-equal": "Proven split / merge",
   "exact-unequal": "Deterministic discrepancy",
@@ -402,7 +405,7 @@ export function AnalyzeWorkspace() {
     [analysis, issueMode],
   );
   const selectedIssueIndex = Math.max(0, issueList.findIndex((item) => item.id === selectedIssueId));
-  const selectedIssue = issueList[selectedIssueIndex];
+  const selectedIssue = analysis?.discrepancies.find((item) => item.id === selectedIssueId) || issueList[selectedIssueIndex];
   const activeHighlight = hoveredHighlight || selectedIssue?.id || selectedIssueId;
 
   const stepIssue = (offset: number) => {
@@ -596,6 +599,18 @@ export function AnalyzeWorkspace() {
             </>
           )}
         </div>
+        {selectedIssue && (selectedIssue.status === "mismatch" || selectedIssue.arithmetic) && (
+          <button
+            className={`comparison-bridge ${selectedIssue.arithmetic ? "arithmetic" : "mismatch"}`}
+            type="button"
+            onClick={() => focusDiscrepancy(selectedIssue)}
+            aria-label={`Refocus ${selectedIssue.arithmetic ? "regrouped comparison" : "discrepancy"} between reports`}
+            title={selectedIssue.arithmetic?.expression || `${selectedIssue.valueNew} ≠ ${selectedIssue.valueOld || "—"}`}
+          >
+            {selectedIssue.arithmetic ? <GitCompareArrows size={14} /> : <EqualNot size={14} />}
+            <span>{selectedIssue.arithmetic?.expression || `${selectedIssue.valueNew} ≠ ${selectedIssue.valueOld || "—"}`}</span>
+          </button>
+        )}
         <div className="analysis-slot">
           {!olderPdf ? (
             <DropCard side="older" busy={loadingSide === "older"} onFile={(file) => loadFile("older", file)} />

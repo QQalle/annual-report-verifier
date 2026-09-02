@@ -231,6 +231,30 @@ export class BrowserPdf {
       },
     });
 
+    const horizontalRules: Rect[] = [];
+    const identity = this.mupdf.Matrix.identity;
+    const hairline = new this.mupdf.StrokeState({
+      lineCap: "Butt",
+      lineJoin: "Miter",
+      lineWidth: 0.01,
+      miterLimit: 10,
+    });
+    const retainHorizontalRule = (rect: Rect) => {
+      const width = rect[2] - rect[0];
+      const height = rect[3] - rect[1];
+      if (width >= 60 && height <= 5 && width >= Math.max(20, height * 20)) {
+        horizontalRules.push([...rect] as Rect);
+      }
+    };
+    const graphicsDevice = new this.mupdf.Device({
+      fillPath: (path, _evenOdd, ctm) => retainHorizontalRule(path.getBounds(hairline, ctm) as Rect),
+      strokePath: (path, stroke, ctm) => retainHorizontalRule(path.getBounds(stroke, ctm) as Rect),
+    });
+    page.runPageContents(graphicsDevice, identity);
+    (graphicsDevice as unknown as { close: () => void }).close();
+    graphicsDevice.destroy();
+    hairline.destroy();
+
     const lines = clusterVisualRows(rawLines, pageIndex);
     const tokens = lines.flatMap((line) => line.tokens);
     const extracted: ExtractedPage = {
@@ -239,6 +263,7 @@ export class BrowserPdf {
       text: structured.asText(),
       tokens,
       lines,
+      horizontalRules,
     };
     structured.destroy();
     page.destroy();
