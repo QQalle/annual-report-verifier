@@ -44,6 +44,7 @@ type ModelMapping = {
   newerIds: string[];
   olderIds: string[];
   relationship: "direct" | "aggregate" | "none";
+  reason?: string;
 };
 
 type ArithmeticProposal = {
@@ -56,6 +57,7 @@ type ResolveLabels = (
   newerRows: ModelRow[],
   olderRows: ModelRow[],
   proposedGroups: ArithmeticProposal[],
+  batch: { index: number; count: number },
 ) => Promise<{ mappings: ModelMapping[] }>;
 
 const sectionRules: Array<[RegExp, string]> = [
@@ -450,13 +452,15 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
       Math.abs(item.candidate.relativePage - cell.relativePage) < 0.2,
   );
   const exactCandidates = scored.filter((item) => item.labelScore === 1);
-  const secondExact = exactCandidates.find((item) => item.candidate.id !== best.candidate.id);
+  const sameTable = (candidate: ComparableCell) =>
+    candidate.section === cell.section &&
+    normalizeLabel(candidate.tableTitle) === normalizeLabel(cell.tableTitle);
+  const exactSameContext = exactCandidates.filter((item) => sameTable(item.candidate));
   const confidentMismatch =
     best.labelScore === 1 &&
-    best.candidate.section === cell.section &&
-    best.titleScore >= 0.72 &&
+    sameTable(best.candidate) &&
     Math.abs(best.candidate.relativePage - cell.relativePage) < 0.18 &&
-    (!secondExact || best.contextScore - secondExact.contextScore >= 0.2);
+    exactSameContext.length === 1;
   return {
     ...best,
     // Equal, contextually plausible values are safe to mark green even when a
@@ -464,6 +468,8 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
     // is uniquely stronger than the alternatives.
     ambiguous: !equalMatch && plausible.length > 1 && !confidentMismatch,
     confidentMismatch,
+    candidateCount: plausible.length || scored.length,
+    sameTableContext: sameTable(best.candidate),
   };
 }
 
@@ -526,9 +532,10 @@ function buildArithmeticProposals(
 ) {
   const proposals: ArithmeticProposal[] = [];
   const seen = new Set<string>();
+  const maxForwardProposals = unresolved.length * 3;
+  const maxTotalProposals = 80;
 
   for (const { cell, match } of unresolved) {
-    if (proposals.length >= 80) break;
     const title = normalizeLabel(cell.tableTitle);
     const pool = olderCandidates
       .filter((candidate) =>
@@ -562,17 +569,22 @@ function buildArithmeticProposals(
         seen.add(signature);
         proposals.push({ newerIds: [cell.id], olderIds, relationship: "aggregate" });
         proposalsForCell += 1;
-        if (proposalsForCell >= 6 || proposals.length >= 80) break;
+        if (proposalsForCell >= 3) break;
       }
-      if (proposalsForCell >= 6 || proposals.length >= 80) break;
+      if (proposalsForCell >= 3) break;
     }
   }
+
+  // With batches of at most 20 rows, three proposals per row leaves every row
+  // a fair chance before the request-level cap is used for inverse groups.
+  if (proposals.length > maxForwardProposals) proposals.splice(maxForwardProposals);
 
   // Search the inverse direction as well: several rows in the newer report may
   // have replaced one combined row in the older report. These groups are still
   // bounded and proven numerically before the model sees their IDs.
+  const inverseCoveredNewerIds = new Set<string>();
   for (const older of olderCandidates) {
-    if (proposals.length >= 80) break;
+    if (proposals.length >= maxTotalProposals) break;
     if (protectedOlderIds.has(older.id) || older.value === 0) continue;
     const pool = unresolved
       .map(({ cell }) => cell)
@@ -594,6 +606,7 @@ function buildArithmeticProposals(
       for (const selected of subsetsOfSize(pool, size, 1500)) {
         const total = selected.reduce((sum, candidate) => sum + candidate.value, 0);
         if (!arithmeticEqual(total, older.value)) continue;
+        if (selected.every((candidate) => inverseCoveredNewerIds.has(candidate.id))) continue;
         const newerIds = [...selected]
           .sort((a, b) => a.page - b.page || a.token.rect[1] - b.token.rect[1])
           .map((candidate) => candidate.id);
@@ -601,10 +614,11 @@ function buildArithmeticProposals(
         if (seen.has(signature)) continue;
         seen.add(signature);
         proposals.push({ newerIds, olderIds: [older.id], relationship: "aggregate" });
+        newerIds.forEach((id) => inverseCoveredNewerIds.add(id));
         proposalsForCell += 1;
-        if (proposalsForCell >= 6 || proposals.length >= 80) break;
+        if (proposalsForCell >= 1 || proposals.length >= maxTotalProposals) break;
       }
-      if (proposalsForCell >= 6 || proposals.length >= 80) break;
+      if (proposalsForCell >= 1 || proposals.length >= maxTotalProposals) break;
     }
   }
   return proposals;
@@ -673,23 +687,47 @@ export async function analyzePair(
     cell,
     match: bestCandidate(cell, olderByYear.get(cell.year) || []),
   }));
+  const counterpartClaims = new Map<string, Array<(typeof preliminary)[number]>>();
+  for (const item of preliminary) {
+    if (item.match && !item.match.ambiguous) {
+      const claims = counterpartClaims.get(item.match.candidate.id) || [];
+      claims.push(item);
+      counterpartClaims.set(item.match.candidate.id, claims);
+    }
+  }
+  const collidingNewerIds = new Set<string>();
+  for (const claims of counterpartClaims.values()) {
+    if (claims.length < 2) continue;
+    const exactSameTableClaims = claims.filter((item) =>
+      item.match?.labelScore === 1 && item.match.sameTableContext,
+    );
+    const collisions = exactSameTableClaims.length === 1
+      ? claims.filter((item) => item !== exactSameTableClaims[0])
+      : claims;
+    collisions.forEach((item) => collidingNewerIds.add(item.cell.id));
+  }
+  const hasCounterpartCollision = (item: (typeof preliminary)[number]) =>
+    collidingNewerIds.has(item.cell.id);
   const unresolved = preliminary.filter(
-    (item) => !item.match || !item.match.equal || item.match.ambiguous,
+    (item) => !item.match || !item.match.equal || item.match.ambiguous || hasCounterpartCollision(item),
   );
   const protectedOlderIds = new Set(
     preliminary
-      .filter((item) => item.match?.equal && !item.match.ambiguous)
+      .filter((item) => item.match?.equal && !item.match.ambiguous && !hasCounterpartCollision(item))
       .map((item) => item.match!.candidate.id),
   );
   const deterministicMismatchTargets = new Map(
     preliminary
-      .filter((item) => item.match?.confidentMismatch)
+      .filter((item) => item.match?.confidentMismatch && !hasCounterpartCollision(item))
       .map((item) => [item.cell.id, item.match!.candidate.id]),
   );
   const mappings: ModelMapping[] = [];
+  let batchesAttempted = 0;
+  let batchesFailed = 0;
+  let mappingsRejected = 0;
 
   if (unresolved.length && options?.resolveLabels) {
-    const batchSize = 40;
+    const batchSize = 20;
     const batches = Array.from(
       { length: Math.ceil(unresolved.length / batchSize) },
       (_, index) => unresolved.slice(index * batchSize, (index + 1) * batchSize),
@@ -697,7 +735,7 @@ export async function analyzePair(
     const newerById = new Map(newerCells.map((cell) => [cell.id, cell]));
     const olderById = new Map(olderCells.map((cell) => [cell.id, cell]));
     const usedNewer = new Set<string>();
-    const usedOlder = new Set<string>();
+    const usedOlder = new Set<string>(protectedOlderIds);
 
     for (const [batchIndex, batch] of batches.entries()) {
       const newerRows = batch.map((item) => toModelRow(item.cell));
@@ -725,6 +763,7 @@ export async function analyzePair(
       const olderRows = olderCandidateCells.map(toModelRow);
       const proposedGroups = buildArithmeticProposals(batch, olderCandidateCells, protectedOlderIds);
       if (!newerRows.length || !olderRows.length) continue;
+      batchesAttempted += 1;
 
       const batchLabel = batches.length > 1 ? ` (batch ${batchIndex + 1}/${batches.length})` : "";
       options.onProgress?.(
@@ -734,7 +773,10 @@ export async function analyzePair(
           : "Resolving renamed rows with the selected model") + batchLabel,
       );
       try {
-        const response = await options.resolveLabels(newerRows, olderRows, proposedGroups);
+        const response = await options.resolveLabels(newerRows, olderRows, proposedGroups, {
+          index: batchIndex + 1,
+          count: batches.length,
+        });
         const validNewerIds = new Set(newerRows.map((row) => row.id));
         const validOlderIds = new Set(olderRows.map((row) => row.id));
         const proposedSignatures = new Set(
@@ -782,12 +824,16 @@ export async function analyzePair(
             !isApprovedProposal ||
             !arithmeticAgrees ||
             !preservesDeterministicMismatch
-          ) continue;
+          ) {
+            mappingsRejected += 1;
+            continue;
+          }
           mappedNewerIds.forEach((id) => usedNewer.add(id));
           mappedOlderIds.forEach((id) => usedOlder.add(id));
           mappings.push({ ...mapping, newerIds: mappedNewerIds, olderIds: mappedOlderIds });
         }
       } catch {
+        batchesFailed += 1;
         // Continue through later batches; deterministic results remain valid and unresolved cells stay gray.
       }
     }
@@ -860,6 +906,25 @@ export async function analyzePair(
                 olderTerms: olderGroup.map((item) => ({ label: item.label, value: item.valueText })),
               }
             : undefined,
+          evidence: {
+            reason: isArithmetic
+              ? "aggregate-equal"
+              : equal
+                ? "model-equal"
+                : exactAlignedDirect
+                  ? "exact-unequal"
+                  : "model-unequal",
+            verdict: equal ? "verified" : exactAlignedDirect ? "discrepancy" : "review",
+            labelAlignment: isArithmetic || mapping.relationship === "direct" ? "semantic" : "weak",
+            contextAlignment: match?.sameTableContext ? "same-table" : "compatible",
+            uniqueCounterpart: mapping.newerIds.length === 1 && mapping.olderIds.length === 1,
+            candidateCount: match?.candidateCount || olderGroup.length,
+            deterministic: true,
+            normalizedNewer: newerTotal,
+            normalizedOlder: olderTotal,
+            modelRole: isArithmetic ? "arithmetic-coherence" : "rename",
+            modelReason: mapping.reason?.slice(0, 500),
+          },
         });
         continue;
       }
@@ -872,8 +937,11 @@ export async function analyzePair(
     const comparedValue = source?.value ?? null;
     const equal = comparedValue !== null && Math.abs(cell.value - comparedValue) < 0.000001;
     const uncertain = Boolean(match?.ambiguous);
+    const counterpartReused = hasCounterpartCollision({ cell, match });
     const status: Discrepancy["status"] = comparedValue === null
       ? "missing"
+      : counterpartReused
+        ? "missing"
       : equal
         ? "match"
         : match?.confidentMismatch && !uncertain
@@ -889,9 +957,45 @@ export async function analyzePair(
       valueNew: cell.valueText,
       valueOld: source?.valueText,
       matchMethod: method,
-      explanation: describe(status, cell, source, source?.valueText, comparedValue !== null && status === "missing"),
+      explanation: counterpartReused
+        ? `${cell.year}: this prior-report occurrence was claimed by more than one newer row, so the alignment was not judged.`
+        : describe(status, cell, source, source?.valueText, comparedValue !== null && status === "missing"),
       newer: evidence(cell),
       older: source ? evidence(source) : undefined,
+      evidence: {
+        reason: status === "mismatch"
+          ? "exact-unequal"
+          : counterpartReused
+            ? "counterpart-reused"
+            : status === "match"
+              ? cell.label.includes("�") || source?.label.includes("�")
+                ? "damaged-text-equal"
+                : "exact-equal"
+              : uncertain
+                ? "ambiguous-counterpart"
+                : source
+                  ? "weak-counterpart"
+                  : "no-counterpart",
+        verdict: status === "match" ? "verified" : status === "mismatch" ? "discrepancy" : "review",
+        labelAlignment: match?.labelScore === 1
+          ? "exact"
+          : cell.label.includes("�") || source?.label.includes("�")
+            ? "damaged-text"
+            : match
+              ? "weak"
+              : "none",
+        contextAlignment: match?.sameTableContext
+          ? "same-table"
+          : match
+            ? "compatible"
+            : "none",
+        uniqueCounterpart: Boolean(match && !match.ambiguous && !counterpartReused),
+        candidateCount: match?.candidateCount || 0,
+        deterministic: true,
+        normalizedNewer: cell.value,
+        normalizedOlder: source?.value,
+        modelRole: "none",
+      },
     });
   }
 
@@ -909,5 +1013,20 @@ export async function analyzePair(
     olderYear,
     comparedCells: discrepancies.length,
     modelAssisted,
+    coverage: {
+      newerExtractedCells: allNewerCells.length,
+      olderExtractedCells: olderCells.length,
+      overlappingYearCells: newerCells.length,
+      verifiedCells: discrepancies.filter((item) => item.status === "match").length,
+      reviewCells: discrepancies.filter((item) => item.status === "missing").length,
+      discrepancyCells: discrepancies.filter((item) => item.status === "mismatch").length,
+    },
+    modelReview: {
+      enabled: Boolean(options?.resolveLabels),
+      batchesAttempted,
+      batchesFailed,
+      mappingsAccepted: mappings.length,
+      mappingsRejected,
+    },
   };
 }

@@ -2,21 +2,25 @@
 
 import {
   AlertTriangle,
+  Bot,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
   CircleDashed,
   Link2,
   LoaderCircle,
+  Sigma,
   ScanSearch,
   UploadCloud,
   Unlink2,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { reportPairs } from "@/lib/catalog";
 import { useModel } from "@/lib/model-context";
 import { analyzePair } from "@/lib/compare";
-import { BrowserPdf, detectReportYear } from "@/lib/pdf-engine";
+import { BrowserPdf, detectReportYear, fetchCataloguePdf } from "@/lib/pdf-engine";
 import type { AnalysisResult, Discrepancy, EvidenceTarget } from "@/lib/types";
 import { PdfViewer } from "./PdfViewer";
 
@@ -73,10 +77,18 @@ function DropCard({
   );
 }
 
-function YearControl({ year, onChange }: { year: number | null; onChange: (year: number) => void }) {
+function YearControl({
+  year,
+  detectedYear,
+  onChange,
+}: {
+  year: number | null;
+  detectedYear: number | null;
+  onChange: (year: number) => void;
+}) {
   return (
     <label className="year-control">
-      <span>Report year</span>
+      <span>Report year · {detectedYear ? detectedYear === year ? "detected" : "manual" : "manual required"}</span>
       <input
         type="number"
         min="1990"
@@ -89,11 +101,84 @@ function YearControl({ year, onChange }: { year: number | null; onChange: (year:
   );
 }
 
+const reasonLabels: Record<Discrepancy["evidence"]["reason"], string> = {
+  "exact-equal": "Exact row and value",
+  "damaged-text-equal": "Equal despite damaged text",
+  "model-equal": "Model-supported rename",
+  "aggregate-equal": "Proven split / merge",
+  "exact-unequal": "Deterministic discrepancy",
+  "ambiguous-counterpart": "Several plausible counterparts",
+  "counterpart-reused": "Counterpart claimed twice",
+  "weak-counterpart": "Alignment too weak",
+  "model-unequal": "Possible rename, unequal values",
+  "no-counterpart": "No reliable counterpart",
+};
+
+function EvidencePanel({
+  item,
+  onFocus,
+  reviewed,
+  onToggleReviewed,
+}: {
+  item?: Discrepancy;
+  onFocus: (item: Discrepancy, clicked?: { side: Side; target: EvidenceTarget }) => void;
+  reviewed: boolean;
+  onToggleReviewed: () => void;
+}) {
+  if (!item) return null;
+  const statusLabel = item.status === "mismatch" ? "Discrepancy" : item.status === "match" ? "Verified" : "Human review";
+  return (
+    <article className={`evidence-panel ${item.status}`} aria-live="polite">
+      <div className="evidence-verdict">
+        <span className="eyebrow">Selected finding · {item.section}</span>
+        <strong>{statusLabel}</strong>
+        <small>{reasonLabels[item.evidence.reason]}</small>
+      </div>
+      <div className="evidence-comparison">
+        <div>
+          <span>Newer report · p. {item.newer.page + 1}</span>
+          <strong>{item.labelNew}</strong>
+          <code>{item.valueNew}</code>
+        </div>
+        <span className="comparison-symbol">{item.status === "mismatch" ? "≠" : item.status === "match" ? "=" : "↔"}</span>
+        <div>
+          <span>{item.older ? `Prior report · p. ${item.older.page + 1}` : "Prior report"}</span>
+          <strong>{item.labelOld || "No reliable row"}</strong>
+          <code>{item.valueOld || "—"}</code>
+        </div>
+      </div>
+      <div className="evidence-rationale">
+        <p>{item.explanation}</p>
+        <div className="evidence-tags">
+          <span>Label: {item.evidence.labelAlignment.replace("-", " ")}</span>
+          <span>Context: {item.evidence.contextAlignment.replace("-", " ")}</span>
+          <span>{item.evidence.uniqueCounterpart ? "Unique counterpart" : `${item.evidence.candidateCount || "No"} candidates`}</span>
+          <span>Deterministic values</span>
+          {item.evidence.modelRole !== "none" && <span><Bot size={11} /> Model: {item.evidence.modelRole.replace("-", " ")}</span>}
+          {item.arithmetic && <span><Sigma size={11} /> {item.arithmetic.expression}</span>}
+        </div>
+        {item.evidence.modelReason && <small className="model-reason">Model rationale: {item.evidence.modelReason}</small>}
+      </div>
+      <div className="evidence-actions">
+        <button type="button" onClick={() => onFocus(item, { side: "newer", target: item.newer })}>Newer source</button>
+        <button type="button" onClick={() => item.older && onFocus(item, { side: "older", target: item.older })} disabled={!item.older}>Prior source</button>
+        <button className={reviewed ? "reviewed" : ""} type="button" onClick={onToggleReviewed}>
+          {reviewed ? <><CheckCircle2 size={11} /> Reviewed</> : "Mark reviewed"}
+        </button>
+        <small>J / K to review</small>
+      </div>
+    </article>
+  );
+}
+
 export function AnalyzeWorkspace() {
+  const searchParams = useSearchParams();
   const [newerPdf, setNewerPdf] = useState<BrowserPdf | null>(null);
   const [olderPdf, setOlderPdf] = useState<BrowserPdf | null>(null);
   const [newerYear, setNewerYear] = useState<number | null>(null);
   const [olderYear, setOlderYear] = useState<number | null>(null);
+  const [newerDetectedYear, setNewerDetectedYear] = useState<number | null>(null);
+  const [olderDetectedYear, setOlderDetectedYear] = useState<number | null>(null);
   const [newerPage, setNewerPage] = useState(0);
   const [olderPage, setOlderPage] = useState(0);
   const [loadingSide, setLoadingSide] = useState<Side | null>(null);
@@ -104,8 +189,9 @@ export function AnalyzeWorkspace() {
   const [error, setError] = useState<string | null>(null);
   const [hoveredHighlight, setHoveredHighlight] = useState<string | null>(null);
   const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
-  const [issueMode, setIssueMode] = useState<"mismatch" | "all">("mismatch");
+  const [issueMode, setIssueMode] = useState<"discrepancy" | "review" | "all">("discrepancy");
   const [syncEnabled, setSyncEnabled] = useState(true);
+  const [reviewedIssueIds, setReviewedIssueIds] = useState<Set<string>>(() => new Set());
   const [syncRequest, setSyncRequest] = useState<{
     id: number;
     targetSide: Side;
@@ -119,16 +205,64 @@ export function AnalyzeWorkspace() {
   const newerRef = useRef<BrowserPdf | null>(null);
   const olderRef = useRef<BrowserPdf | null>(null);
   const interactionId = useRef(0);
+  const loadedCataloguePair = useRef<string | null>(null);
 
   useEffect(() => () => {
     newerRef.current?.destroy();
     olderRef.current?.destroy();
   }, []);
 
+  useEffect(() => {
+    const pairId = searchParams.get("pair");
+    const pair = reportPairs.find((item) => item.id === pairId);
+    if (!pair || loadedCataloguePair.current === pair.id) return;
+    loadedCataloguePair.current = pair.id;
+    let cancelled = false;
+    let completed = false;
+    setError(null);
+    setAnalysis(null);
+    setReviewedIssueIds(new Set());
+
+    const load = async () => {
+      try {
+        setLoadingSide("newer");
+        const newer = await fetchCataloguePdf(pair.latest.url, pair.latest.filename);
+        if (cancelled) return newer.destroy();
+        newerRef.current?.destroy();
+        newerRef.current = newer;
+        setNewerPdf(newer);
+        setNewerYear(pair.latest.year);
+        setNewerDetectedYear(pair.latest.year);
+        setNewerPage(0);
+
+        setLoadingSide("older");
+        const older = await fetchCataloguePdf(pair.previous.url, pair.previous.filename);
+        if (cancelled) return older.destroy();
+        olderRef.current?.destroy();
+        olderRef.current = older;
+        setOlderPdf(older);
+        setOlderYear(pair.previous.year);
+        setOlderDetectedYear(pair.previous.year);
+        setOlderPage(0);
+        completed = true;
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : "Could not open the catalogue pair");
+      } finally {
+        if (!cancelled) setLoadingSide(null);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+      if (!completed && loadedCataloguePair.current === pair.id) loadedCataloguePair.current = null;
+    };
+  }, [searchParams]);
+
   const loadFile = async (side: Side, file: File) => {
     setLoadingSide(side);
     setError(null);
     setAnalysis(null);
+    setReviewedIssueIds(new Set());
     try {
       const pdf = await BrowserPdf.load(await file.arrayBuffer(), file.name);
       const year = await detectReportYear(pdf);
@@ -137,12 +271,14 @@ export function AnalyzeWorkspace() {
         newerRef.current = pdf;
         setNewerPdf(pdf);
         setNewerYear(year);
+        setNewerDetectedYear(year);
         setNewerPage(0);
       } else {
         olderRef.current?.destroy();
         olderRef.current = pdf;
         setOlderPdf(pdf);
         setOlderYear(year);
+        setOlderDetectedYear(year);
         setOlderPage(0);
       }
     } catch (reason) {
@@ -158,13 +294,16 @@ export function AnalyzeWorkspace() {
       newerRef.current = null;
       setNewerPdf(null);
       setNewerYear(null);
+      setNewerDetectedYear(null);
     } else {
       olderRef.current?.destroy();
       olderRef.current = null;
       setOlderPdf(null);
       setOlderYear(null);
+      setOlderDetectedYear(null);
     }
     setAnalysis(null);
+    setReviewedIssueIds(new Set());
   };
 
   const yearError =
@@ -204,6 +343,7 @@ export function AnalyzeWorkspace() {
     setProgress(0);
     setError(null);
     setAnalysis(null);
+    setReviewedIssueIds(new Set());
     try {
       const result = await analyzePair(newerPdf, olderPdf, newerYear, olderYear, {
         onProgress: (value, label) => {
@@ -211,20 +351,28 @@ export function AnalyzeWorkspace() {
           setProgressLabel(label);
         },
         resolveLabels: isConfigured
-          ? (newerRows, olderRows, proposedGroups) =>
-              callModel("match-labels", { newerRows, olderRows, proposedGroups }) as Promise<{
+          ? (newerRows, olderRows, proposedGroups, batch) =>
+              callModel("match-labels", { newerRows, olderRows, proposedGroups, batch }) as Promise<{
                 mappings: Array<{
                   newerIds: string[];
                   olderIds: string[];
                   relationship: "direct" | "aggregate" | "none";
+                  reason?: string;
                 }>;
               }>
           : undefined,
       });
       setAnalysis(result);
+      setReviewedIssueIds(new Set());
       const firstIssue = result.discrepancies.find((item) => item.status === "mismatch") || result.discrepancies[0];
       if (firstIssue) {
-        setIssueMode(result.discrepancies.some((item) => item.status === "mismatch") ? "mismatch" : "all");
+        setIssueMode(
+          result.discrepancies.some((item) => item.status === "mismatch")
+            ? "discrepancy"
+            : result.discrepancies.some((item) => item.status === "missing")
+              ? "review"
+              : "all",
+        );
         focusDiscrepancy(firstIssue);
       }
     } catch (reason) {
@@ -240,23 +388,39 @@ export function AnalyzeWorkspace() {
         { match: 0, mismatch: 0, missing: 0 },
       )
     : { match: 0, mismatch: 0, missing: 0 };
+  const arithmeticCount = analysis?.discrepancies.filter((item) => Boolean(item.arithmetic)).length || 0;
 
   const issueList = useMemo(
     () =>
       analysis?.discrepancies.filter((item) =>
-        issueMode === "mismatch" ? item.status === "mismatch" : item.status !== "match",
+        issueMode === "discrepancy"
+          ? item.status === "mismatch"
+          : issueMode === "review"
+            ? item.status === "missing"
+            : true,
       ) || [],
     [analysis, issueMode],
   );
   const selectedIssueIndex = Math.max(0, issueList.findIndex((item) => item.id === selectedIssueId));
   const selectedIssue = issueList[selectedIssueIndex];
-  const activeHighlight = hoveredHighlight || selectedIssueId;
+  const activeHighlight = hoveredHighlight || selectedIssue?.id || selectedIssueId;
 
   const stepIssue = (offset: number) => {
     if (!issueList.length) return;
     const next = (selectedIssueIndex + offset + issueList.length) % issueList.length;
     focusDiscrepancy(issueList[next]);
   };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.matches("input, textarea, select, button, summary")) return;
+      if (event.key.toLowerCase() === "j") stepIssue(1);
+      if (event.key.toLowerCase() === "k") stepIssue(-1);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
   return (
     <div className="analyze-page">
@@ -307,25 +471,34 @@ export function AnalyzeWorkspace() {
       {analysis && (
         <div className="analysis-summary">
           <div className="result-counts">
-            <span className="result-stat match"><CheckCircle2 size={14} /><strong>{counts.match}</strong> match</span>
             <span className="result-stat mismatch"><AlertTriangle size={14} /><strong>{counts.mismatch}</strong> discrepancies</span>
-            <span className="result-stat missing"><CircleDashed size={14} /><strong>{counts.missing}</strong> no counterpart</span>
+            <span className="result-stat missing"><CircleDashed size={14} /><strong>{counts.missing}</strong> review</span>
+            <span className="result-stat match"><CheckCircle2 size={14} /><strong>{counts.match}</strong> verified</span>
+            {arithmeticCount > 0 && <span className="result-stat arithmetic"><Sigma size={14} /><strong>{arithmeticCount}</strong> regrouped</span>}
           </div>
           <div className="discrepancy-navigator">
             <button
-              className={`issue-mode ${issueMode === "mismatch" ? "active" : ""}`}
+              className={`issue-mode ${issueMode === "discrepancy" ? "active" : ""}`}
               type="button"
-              onClick={() => setIssueMode("mismatch")}
+              onClick={() => setIssueMode("discrepancy")}
               disabled={!counts.mismatch}
             >
-              Red only
+              Discrepancies
+            </button>
+            <button
+              className={`issue-mode ${issueMode === "review" ? "active" : ""}`}
+              type="button"
+              onClick={() => setIssueMode("review")}
+              disabled={!counts.missing}
+            >
+              Review
             </button>
             <button
               className={`issue-mode ${issueMode === "all" ? "active" : ""}`}
               type="button"
               onClick={() => setIssueMode("all")}
             >
-              Red + gray
+              All
             </button>
             <button className="icon-button" type="button" onClick={() => stepIssue(-1)} disabled={!issueList.length} aria-label="Previous discrepancy">
               <ChevronLeft size={14} />
@@ -344,10 +517,17 @@ export function AnalyzeWorkspace() {
             </button>
           </div>
           <span className="analysis-method">
-            {analysis.comparedCells} cells · {analysis.modelAssisted} model-assisted
+            {reviewedIssueIds.size}/{analysis.comparedCells} reviewed · {analysis.coverage.overlappingYearCells} comparative cells · {analysis.modelAssisted} model-assisted
           </span>
         </div>
       )}
+
+      {analysis?.modelReview.batchesFailed ? (
+        <div className="analysis-alert model-warning">
+          <AlertTriangle size={15} />
+          <span>{analysis.modelReview.batchesFailed} semantic-review batch failed. Deterministic findings remain valid; affected rows stay gray.</span>
+        </div>
+      ) : null}
 
       {analysis?.sections.length ? (
         <nav className="section-jumps" aria-label="Comparable report sections">
@@ -369,6 +549,24 @@ export function AnalyzeWorkspace() {
         </nav>
       ) : null}
 
+
+      {analysis && (
+        <EvidencePanel
+          item={selectedIssue}
+          onFocus={focusDiscrepancy}
+          reviewed={Boolean(selectedIssue && reviewedIssueIds.has(selectedIssue.id))}
+          onToggleReviewed={() => {
+            if (!selectedIssue) return;
+            setReviewedIssueIds((current) => {
+              const next = new Set(current);
+              if (next.has(selectedIssue.id)) next.delete(selectedIssue.id);
+              else next.add(selectedIssue.id);
+              return next;
+            });
+          }}
+        />
+      )}
+
       <div className="analysis-viewers">
         <div className="analysis-slot">
           {!newerPdf ? (
@@ -376,7 +574,7 @@ export function AnalyzeWorkspace() {
           ) : (
             <>
               <div className="slot-meta">
-                <YearControl year={newerYear} onChange={setNewerYear} />
+                <YearControl year={newerYear} detectedYear={newerDetectedYear} onChange={setNewerYear} />
                 <button className="quiet-button" type="button" onClick={() => clearSide("newer")}><X size={13} /> Replace</button>
               </div>
               <PdfViewer
@@ -404,7 +602,7 @@ export function AnalyzeWorkspace() {
           ) : (
             <>
               <div className="slot-meta">
-                <YearControl year={olderYear} onChange={setOlderYear} />
+                <YearControl year={olderYear} detectedYear={olderDetectedYear} onChange={setOlderYear} />
                 <button className="quiet-button" type="button" onClick={() => clearSide("older")}><X size={13} /> Replace</button>
               </div>
               <PdfViewer

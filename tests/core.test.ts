@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { requestDefinition } from "../app/api/model/route.ts";
+import { requestDefinition, validateModelResult } from "../app/api/model/route.ts";
 import { analyzePair } from "../lib/compare.ts";
 import { selectConfiguredProvider } from "../lib/model-config.ts";
 import type { BrowserPdf } from "../lib/pdf-engine.ts";
@@ -264,6 +264,89 @@ test("scrambled numbers stay numeric and change", () => {
   assert.notEqual(parseSwedishNumber(replacement), null);
 });
 
+test("untouched downloads preserve source bytes and scrambled exports remove live source text", async () => {
+  const mupdf = (await import("mupdf")).default;
+  const fixture = new mupdf.PDFDocument();
+  const pageObject = fixture.addPage(
+    [0, 0, 300, 200],
+    0,
+    { Font: { F1: { Type: "Font", Subtype: "Type1", BaseFont: "Helvetica" } } },
+    new TextEncoder().encode("BT /F1 12 Tf 40 100 Td (Secret 123) Tj ET"),
+  );
+  fixture.insertPage(-1, pageObject);
+  const buffer = fixture.saveToBuffer("garbage=4");
+  const source = new Uint8Array(buffer.asUint8Array());
+  buffer.destroy();
+  fixture.destroy();
+
+  const pdf = await (await import("../lib/pdf-engine.ts")).BrowserPdf.load(source, "fixture.pdf");
+  assert.deepEqual(pdf.downloadBytes(), source, "the untouched download is byte-for-byte original");
+  const rendered = await pdf.renderPage(0, 1);
+  const png = new Uint8Array(await (await fetch(rendered.url)).arrayBuffer());
+  assert.deepEqual([...png.slice(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.equal(rendered.width, 300);
+  URL.revokeObjectURL(rendered.url);
+  const extracted = await pdf.extractPage(0);
+  const secret = extracted.tokens.find((item) => item.text === "Secret");
+  assert.ok(secret);
+  await pdf.applyChange({
+    id: secret.id,
+    page: secret.page,
+    rect: secret.rect,
+    original: secret.text,
+    replacement: "Public",
+    fontSize: secret.fontSize,
+    align: "left",
+  });
+  const exported = pdf.downloadBytes();
+  assert.notDeepEqual(exported, source);
+  const reopened = await (await import("../lib/pdf-engine.ts")).BrowserPdf.load(exported, "fixture-scrambled.pdf");
+  const exportedText = (await reopened.extractPage(0)).text;
+  assert.doesNotMatch(exportedText, /Secret/);
+  assert.match(exportedText, /Public/);
+  reopened.destroy();
+  pdf.destroy();
+});
+
+test("a local text-layer PDF pair produces coordinate-linked red evidence", async () => {
+  const mupdf = (await import("mupdf")).default;
+  const makePdf = (years: [number, number], values: [number, number]) => {
+    const document = new mupdf.PDFDocument();
+    const content = [
+      "BT /F1 12 Tf 30 750 Td (INCOME STATEMENT) Tj ET",
+      `BT /F1 10 Tf 280 700 Td (${years[0]}) Tj ET`,
+      `BT /F1 10 Tf 380 700 Td (${years[1]}) Tj ET`,
+      "BT /F1 10 Tf 30 650 Td (Nettoomsattning) Tj ET",
+      `BT /F1 10 Tf 290 650 Td (${values[0]}) Tj ET`,
+      `BT /F1 10 Tf 390 650 Td (${values[1]}) Tj ET`,
+    ].join("\n");
+    const page = document.addPage(
+      [0, 0, 600, 800],
+      0,
+      { Font: { F1: { Type: "Font", Subtype: "Type1", BaseFont: "Helvetica" } } },
+      new TextEncoder().encode(content),
+    );
+    document.insertPage(-1, page);
+    const saved = document.saveToBuffer("garbage=4");
+    const bytes = new Uint8Array(saved.asUint8Array());
+    saved.destroy();
+    document.destroy();
+    return bytes;
+  };
+  const { BrowserPdf: Pdf } = await import("../lib/pdf-engine.ts");
+  const newer = await Pdf.load(makePdf([2025, 2024], [130, 101]), "newer-2025.pdf");
+  const older = await Pdf.load(makePdf([2024, 2023], [100, 80]), "older-2024.pdf");
+  const result = await analyzePair(newer, older, 2025, 2024);
+  assert.equal(result.discrepancies.length, 1);
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].newer.page, 0);
+  assert.equal(result.discrepancies[0].older?.page, 0);
+  assert.ok(result.discrepancies[0].newer.rect[2] > result.discrepancies[0].newer.rect[0]);
+  assert.ok(result.discrepancies[0].older!.keyRect);
+  newer.destroy();
+  older.destroy();
+});
+
 test("equal repeated rows use the agreeing context instead of an unequal duplicate", async () => {
   const newerPages = Array.from({ length: 6 }, (_, page) =>
     reportPage(page, [2025, 2024], page === 2 ? [{ label: "Nettoomsättning", values: [130, 100] }] : []),
@@ -313,6 +396,29 @@ test("a unique exact row with unequal values is a discrepancy", async () => {
   const older = [reportPage(0, [2024, 2023], [{ label: "Nettoomsättning", values: [100, 80] }])];
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
   assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].evidence.reason, "exact-unequal");
+  assert.equal(result.discrepancies[0].evidence.contextAlignment, "same-table");
+});
+
+test("an exact label in a different table context cannot become red", async () => {
+  const newer = [reportPage(0, [2025, 2024], [{ label: "Nettoomsättning", values: [130, 101] }], { title: "NOT 2, INTÄKTER" })];
+  const older = [reportPage(0, [2024, 2023], [{ label: "Nettoomsättning", values: [100, 80] }], { title: "NOT 8, SEGMENTSINFORMATION" })];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.equal(result.discrepancies[0].status, "missing");
+  assert.equal(result.discrepancies[0].evidence.verdict, "review");
+});
+
+test("one prior occurrence cannot verify two newer rows", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Serviceavtal", values: [140, 100] },
+    { label: "Serviceavtal", values: [150, 100] },
+  ], { title: "NOT 5, REPARATIONER" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Serviceavtal", values: [100, 80] },
+  ], { title: "NOT 5, REPARATIONER" })];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.deepEqual(result.discrepancies.map((item) => item.status), ["missing", "missing"]);
+  assert.ok(result.discrepancies.every((item) => item.evidence.reason === "counterpart-reused"));
 });
 
 test("model-assisted renamed rows use occurrence IDs and structural context", async () => {
@@ -374,6 +480,27 @@ test("semantic matching prompt explicitly treats residual labels as contextual",
   assert.match(definition.system || "", /Never match two residual rows merely because/);
   assert.match(definition.system || "", /Use direct for one-to-one equivalent concepts/);
   assert.match(definition.system || "", /Proposed aggregate groups have already been/);
+  const mappingSchema = (((definition.schema.properties as Record<string, unknown>).mappings as {
+    items: { required: string[] };
+  }).items.required);
+  assert.ok(mappingSchema.includes("reason"));
+});
+
+test("application validation rejects malformed structured model results", () => {
+  assert.throws(
+    () => validateModelResult("synonym", { synonym: "rad\nbrytning", reason: "unsafe" }),
+    /validation/,
+  );
+  assert.throws(
+    () => validateModelResult("match-labels", {
+      mappings: [{ newerIds: ["new"], olderIds: ["old"], relationship: "direct" }],
+    }),
+    /validation/,
+  );
+  assert.deepEqual(
+    validateModelResult("connection", { ok: true, ignored: "not forwarded" }),
+    { ok: true },
+  );
 });
 
 test("model-assisted split rows are checked arithmetically and grouped", async () => {
@@ -449,6 +576,29 @@ test("model cannot invent an aggregate that was not deterministically proposed",
   assert.equal(result.modelAssisted, 0);
   assert.equal(result.discrepancies[0].status, "missing");
   assert.equal(result.discrepancies[0].arithmetic, undefined);
+});
+
+test("model mappings cannot reuse a row already protected by an exact equal match", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Serviceavtal", values: [130, 100] },
+    { label: "Utökad support", values: [80, 60] },
+  ], { title: "NOT 5, REPARATIONER" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Serviceavtal", values: [100, 90] },
+  ], { title: "NOT 5, REPARATIONER" })];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => ({
+      mappings: [{
+        newerIds: [newerRows.find((row) => row.label === "Utökad support")!.id],
+        olderIds: [olderRows[0].id],
+        relationship: "direct",
+      }],
+    }),
+  });
+  assert.equal(result.discrepancies.find((item) => item.labelNew === "Serviceavtal")?.status, "match");
+  assert.equal(result.discrepancies.find((item) => item.labelNew === "Utökad support")?.status, "missing");
+  assert.equal(result.modelReview.mappingsAccepted, 0);
+  assert.equal(result.modelReview.mappingsRejected, 1);
 });
 
 test("an unequal model-assisted rename remains gray", async () => {
@@ -625,8 +775,21 @@ test("semantic and arithmetic review continues beyond the first model batch", as
     },
   });
 
-  assert.equal(calls, 2);
+  assert.equal(calls, 3);
   const grouped = result.discrepancies.find((item) => item.labelNew === "Rad 44");
   assert.equal(grouped?.status, "match");
   assert.equal(grouped?.arithmetic?.expression, "100 = 40 + 20 + 40");
+  assert.equal(result.modelReview.batchesAttempted, 3);
+  assert.equal(result.modelReview.batchesFailed, 0);
+});
+
+test("a failed semantic batch is observable and leaves deterministic analysis usable", async () => {
+  const newer = [reportPage(0, [2025, 2024], [{ label: "Nytt namn", values: [130, 100] }])];
+  const older = [reportPage(0, [2024, 2023], [{ label: "Gammalt namn", values: [100, 80] }])];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async () => { throw new Error("provider unavailable"); },
+  });
+  assert.equal(result.discrepancies[0].status, "missing");
+  assert.equal(result.modelReview.batchesAttempted, 1);
+  assert.equal(result.modelReview.batchesFailed, 1);
 });

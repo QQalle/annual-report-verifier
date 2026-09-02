@@ -407,6 +407,7 @@ button:disabled {
   border-radius: 6px;
   font-size: 12px;
   font-weight: 540;
+  text-decoration: none;
   cursor: pointer;
   transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
 }
@@ -1582,6 +1583,12 @@ button:disabled {
   font-size: 10px;
 }
 
+.analysis-alert.model-warning {
+  color: #735c00;
+  background: var(--amber-soft);
+  border-color: #eadb9a;
+}
+
 .analysis-progress {
   flex: 0 0 43px;
   margin-bottom: 8px;
@@ -1657,6 +1664,7 @@ button:disabled {
 .result-stat.match { color: var(--green); background: var(--green-soft); }
 .result-stat.mismatch { color: var(--red); background: var(--red-soft); }
 .result-stat.missing { color: #666; background: var(--gray-soft); }
+.result-stat.arithmetic { color: #075eaa; background: #e8f2ff; }
 
 .analysis-method {
   color: var(--muted);
@@ -1749,6 +1757,157 @@ button:disabled {
   border-radius: 4px;
   font-family: var(--font-geist-mono), monospace;
   font-size: 8px;
+}
+
+.evidence-panel {
+  display: grid;
+  flex: 0 0 138px;
+  grid-template-columns: 145px minmax(330px, 0.9fr) minmax(300px, 1.25fr) 92px;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 8px;
+  padding: 11px 12px;
+  background: white;
+  border: 1px solid var(--border);
+  border-left: 3px solid #858585;
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.evidence-panel.match { border-left-color: var(--green); }
+.evidence-panel.mismatch { border-left-color: var(--red); }
+
+.evidence-verdict,
+.evidence-rationale,
+.evidence-actions,
+.evidence-comparison > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.evidence-verdict strong {
+  margin-top: 6px;
+  font-size: 16px;
+  font-weight: 630;
+  letter-spacing: -0.025em;
+}
+
+.evidence-verdict small,
+.evidence-comparison span,
+.evidence-actions small,
+.model-reason {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.evidence-verdict small { margin-top: 3px; }
+
+.evidence-comparison {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) 22px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.evidence-comparison strong {
+  margin: 4px 0 5px;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 590;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evidence-comparison code {
+  align-self: flex-start;
+  padding: 3px 5px;
+  color: var(--foreground);
+  background: #f4f4f4;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+}
+
+.comparison-symbol {
+  color: var(--muted-strong) !important;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 15px !important;
+  text-align: center;
+}
+
+.evidence-rationale p {
+  display: -webkit-box;
+  margin: 0 0 8px;
+  overflow: hidden;
+  color: var(--muted-strong);
+  font-size: 10px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.evidence-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.evidence-tags span {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  gap: 4px;
+  padding: 0 6px;
+  color: var(--muted-strong);
+  background: #f4f4f4;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 8px;
+  text-transform: capitalize;
+}
+
+.model-reason {
+  margin-top: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evidence-actions {
+  gap: 5px;
+}
+
+.evidence-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 28px;
+  color: var(--muted-strong);
+  background: white;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.evidence-actions button.reviewed {
+  color: var(--green);
+  background: var(--green-soft);
+  border-color: #b8dfca;
+}
+
+.evidence-actions button:hover:not(:disabled) {
+  color: var(--foreground);
+  background: #f7f7f7;
+}
+
+.evidence-actions small {
+  margin-top: 2px;
+  text-align: center;
 }
 
 .analysis-viewers {
@@ -1892,6 +2051,11 @@ button:disabled {
 
   .viewer-identity small {
     max-width: 170px;
+  }
+
+  .evidence-panel {
+    grid-template-columns: 126px minmax(280px, 1fr) minmax(260px, 1fr) 84px;
+    gap: 9px;
   }
 }
 

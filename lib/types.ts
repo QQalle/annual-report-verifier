@@ -64,6 +64,32 @@ export type ReportPair = {
 
 export type DiscrepancyStatus = "match" | "mismatch" | "missing";
 
+export type ReviewReason =
+  | "exact-equal"
+  | "damaged-text-equal"
+  | "model-equal"
+  | "aggregate-equal"
+  | "exact-unequal"
+  | "ambiguous-counterpart"
+  | "counterpart-reused"
+  | "weak-counterpart"
+  | "model-unequal"
+  | "no-counterpart";
+
+export type ComparisonEvidence = {
+  reason: ReviewReason;
+  verdict: "verified" | "discrepancy" | "review";
+  labelAlignment: "exact" | "damaged-text" | "semantic" | "weak" | "none";
+  contextAlignment: "same-table" | "compatible" | "weak" | "none";
+  uniqueCounterpart: boolean;
+  candidateCount: number;
+  deterministic: true;
+  normalizedNewer: number;
+  normalizedOlder?: number;
+  modelRole: "none" | "rename" | "arithmetic-coherence";
+  modelReason?: string;
+};
+
 export type EvidenceTarget = {
   page: number;
   rect: Rect;
@@ -94,6 +120,7 @@ export type Discrepancy = {
   newerRelated?: EvidenceTarget[];
   olderRelated?: EvidenceTarget[];
   arithmetic?: ArithmeticCheck;
+  evidence: ComparisonEvidence;
 };
 
 export type NumberHighlight = { page: number; rect: Rect; tokenId: string };
@@ -114,6 +141,21 @@ export type AnalysisResult = {
   olderYear: number;
   comparedCells: number;
   modelAssisted: number;
+  coverage: {
+    newerExtractedCells: number;
+    olderExtractedCells: number;
+    overlappingYearCells: number;
+    verifiedCells: number;
+    reviewCells: number;
+    discrepancyCells: number;
+  };
+  modelReview: {
+    enabled: boolean;
+    batchesAttempted: number;
+    batchesFailed: number;
+    mappingsAccepted: number;
+    mappingsRejected: number;
+  };
 };
 
 export type ModelProvider = "openai" | "anthropic";

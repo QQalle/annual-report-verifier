@@ -342,6 +342,12 @@ export class BrowserPdf {
     return output;
   }
 
+  downloadBytes() {
+    // Preserve the exact input bytes until the user has intentionally made a
+    // change. Re-serializing an untouched PDF is not an "original" download.
+    return this.changes.length ? this.exportBytes() : new Uint8Array(this.sourceBytes);
+  }
+
   destroy() {
     this.document.destroy();
     this.pageCache.clear();

@@ -8,10 +8,12 @@ import {
   LoaderCircle,
   RotateCcw,
   Search,
+  ScanSearch,
   Sparkles,
   UploadCloud,
   X,
 } from "lucide-react";
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { reportPairs } from "@/lib/catalog";
 import { useModel } from "@/lib/model-context";
@@ -39,11 +41,11 @@ function DownloadButton({ pdf, label }: { pdf: BrowserPdf | null; label: string 
       className="quiet-button"
       type="button"
       disabled={!pdf}
-      onClick={() => pdf && download(pdf.exportBytes(), pdf.changes.length ? pdf.name.replace(/\.pdf$/i, "-scrambled.pdf") : pdf.name)}
+      onClick={() => pdf && download(pdf.downloadBytes(), pdf.changes.length ? pdf.name.replace(/\.pdf$/i, "-scrambled.pdf") : pdf.name)}
       title={`Download ${label}`}
     >
       <ArrowDownToLine size={14} />
-      Download
+      {pdf?.changes.length ? "Modified PDF" : "Original PDF"}
     </button>
   );
 }
@@ -293,6 +295,10 @@ export function LibraryWorkspace() {
       setEditorError("That replacement is too long for the selected space.");
       return;
     }
+    if (/[\u0000-\u001f\u007f]/.test(replacement)) {
+      setEditorError("Control characters cannot be written into the PDF.");
+      return;
+    }
     const change: ScrambleChange = {
       id: selectedToken.token.id,
       page: selectedToken.token.page,
@@ -412,6 +418,11 @@ export function LibraryWorkspace() {
                 <h2>{selectedPair?.company || "Your report pair"}</h2>
               </div>
               <div className="workspace-actions">
+                {selectedPair && (
+                  <Link className="button primary" href={`/analyze?pair=${encodeURIComponent(selectedPair.id)}`}>
+                    <ScanSearch size={14} /> {totalChanges ? "Analyze originals" : "Analyze pair"}
+                  </Link>
+                )}
                 {totalChanges > 0 && (
                   <button className="button secondary" type="button" onClick={resetChanges}>
                     <RotateCcw size={14} /> Reset {totalChanges}

@@ -57,8 +57,14 @@ function CallRow({ call }: { call: ModelCall }) {
         <pre>{JSON.stringify(call.request, null, 2)}</pre>
         {call.response !== undefined && (
           <>
-            <label>Response</label>
+            <label>Provider response</label>
             <pre>{JSON.stringify(call.response, null, 2)}</pre>
+          </>
+        )}
+        {call.parsed !== undefined && (
+          <>
+            <label>Validated structured result</label>
+            <pre>{JSON.stringify(call.parsed, null, 2)}</pre>
           </>
         )}
       </div>
@@ -107,7 +113,7 @@ export function ModelSidebar({ onClose }: { onClose: () => void }) {
       <div className="sidebar-heading">
         <div>
           <span className="eyebrow">Model activity</span>
-          <h2>Model setup</h2>
+          <h2>Model audit</h2>
         </div>
         <button className="icon-button" type="button" onClick={onClose} aria-label="Close model sidebar">
           <X size={16} />
@@ -178,7 +184,7 @@ export function ModelSidebar({ onClose }: { onClose: () => void }) {
             </option>
           ))}
         </select>
-        <p className="privacy-note">Held in memory for this session. Never added to call logs.</p>
+        <p className="privacy-note">Held in memory for this session. The key is never added to call logs.</p>
         <button
           className="button secondary full-width"
           type="button"
