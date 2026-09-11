@@ -27,6 +27,7 @@ type ComparableCell = {
   yearRect: Rect;
   tableTitle: string;
   nearbyRows: string[];
+  structuralLabel: boolean;
 };
 
 type ModelRow = {
@@ -44,18 +45,20 @@ type ModelMapping = {
   newerIds: string[];
   olderIds: string[];
   relationship: "direct" | "aggregate" | "none";
+  reason?: string;
 };
 
-type ArithmeticProposal = {
+type DeterministicProposal = {
   newerIds: string[];
   olderIds: string[];
-  relationship: "aggregate";
+  relationship: "direct" | "aggregate";
 };
 
 type ResolveLabels = (
   newerRows: ModelRow[],
   olderRows: ModelRow[],
-  proposedGroups: ArithmeticProposal[],
+  proposedGroups: DeterministicProposal[],
+  batch: { index: number; count: number },
 ) => Promise<{ mappings: ModelMapping[] }>;
 
 const sectionRules: Array<[RegExp, string]> = [
@@ -144,6 +147,50 @@ function labelSimilarity(a: string, b: string, allowDamagedText = false) {
   return allowDamagedText ? Math.max(wordSimilarity, characterSimilarity(a, b)) : wordSimilarity;
 }
 
+function canonicalDamagedLabel(label: string) {
+  return label
+    .toLocaleLowerCase("sv-SE")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9åäöé�]+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function damagedLabelEquivalent(a: string, b: string) {
+  const aDamaged = a.includes("�");
+  const bDamaged = b.includes("�");
+  if (aDamaged === bDamaged) return false;
+  const damaged = canonicalDamagedLabel(aDamaged ? a : b);
+  const intact = canonicalDamagedLabel(aDamaged ? b : a);
+  const pattern = damaged
+    .split("�")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[a-zåäöé]{1,3}");
+  return Boolean(pattern) && new RegExp(`^${pattern}$`, "i").test(intact);
+}
+
+function isStableTableTitle(title: string) {
+  const normalized = normalizeLabel(title);
+  return Boolean(normalized) &&
+    normalized !== "financial table" &&
+    !/^summa(?:\s|$)/.test(normalized);
+}
+
+function sameTableContext(a: ComparableCell, b: ComparableCell) {
+  return isStableTableTitle(a.tableTitle) &&
+    isStableTableTitle(b.tableTitle) &&
+    a.section === b.section &&
+    normalizeLabel(a.tableTitle) === normalizeLabel(b.tableTitle);
+}
+
+function arithmeticContextCompatible(a: ComparableCell, b: ComparableCell) {
+  return sameTableContext(a, b) || (
+    Math.abs(a.page - b.page) <= 1 &&
+    a.tableIndex === b.tableIndex
+  );
+}
+
 function pageSection(page: ExtractedPage) {
   const topText = page.lines
     .filter((line) => line.rect[1] < page.bounds[1] + (page.bounds[3] - page.bounds[1]) * 0.42)
@@ -188,6 +235,8 @@ function tableTitle(lines: PdfLine[], headerTop: number) {
       if (/^\s*\d{6}-?\d{4}\s*$/.test(line.text) || /årsredovisning|annual report/i.test(line.text)) {
         return false;
       }
+      const looksLikeNoteHeading = /^\s*(NOT|NOTE)\s*\d+/i.test(line.text);
+      if (!looksLikeNoteHeading && line.tokens.some((token) => token.isNumber)) return false;
       const words = line.tokens.filter((token) => yearFromToken(token) === null && !token.isNumber);
       const text = words.map((token) => token.text).join(" ");
       return /[a-zåäö]/i.test(text) && normalizeLabel(text).length >= 3;
@@ -329,6 +378,37 @@ function nearbyRowLabels(page: ExtractedPage, lineIndex: number, labelCutoff: nu
     .slice(0, 5);
 }
 
+function unlabeledTotalLabel(
+  page: ExtractedPage,
+  lineIndex: number,
+  line: PdfLine,
+  labelCutoff: number,
+) {
+  if (line.tokens.some((token) => !token.isNumber)) return null;
+  const rule = (page.horizontalRules || [])
+    .filter((candidate) => {
+      const gap = line.rect[1] - candidate[3];
+      return gap >= -1.5 && gap <= 5 && candidate[0] < labelCutoff && candidate[2] - candidate[0] >= 80;
+    })
+    .sort((a, b) => b[3] - a[3])[0];
+  if (!rule) return null;
+
+  const previousLabel = page.lines
+    .slice(Math.max(0, lineIndex - 4), lineIndex)
+    .reverse()
+    .map((candidate) => candidate.tokens
+      .filter((token) => !token.isNumber && token.rect[2] <= labelCutoff)
+      .map((token) => token.text)
+      .join(" ")
+      .trim())
+    .find((label) => normalizeLabel(label).length >= 2);
+  if (!previousLabel) return null;
+  return {
+    text: `Unlabeled total after ${previousLabel}`,
+    rect: rule,
+  };
+}
+
 function extractCells(pages: ExtractedPage[]) {
   const cells: ComparableCell[] = [];
   for (const page of pages) {
@@ -343,11 +423,20 @@ function extractCells(pages: ExtractedPage[]) {
       );
       if (numbers.length < 2) continue;
       const y = line.rect[1];
-      const header = headerBands
-        .filter((candidate) => Math.abs(y - (candidate.rect[1] + candidate.rect[3]) / 2) < 420)
-        .sort((a, b) =>
-          Math.abs(y - (a.rect[1] + a.rect[3]) / 2) - Math.abs(y - (b.rect[1] + b.rect[3]) / 2),
-        )[0];
+      const pageHeight = page.bounds[3] - page.bounds[1];
+      const precedingHeaders = headerBands
+        .filter((candidate) => {
+          const center = (candidate.rect[1] + candidate.rect[3]) / 2;
+          return center <= y + 3 && y - center < Math.max(560, pageHeight * 0.7);
+        })
+        .sort((a, b) => b.rect[3] - a.rect[3]);
+      const followingHeaders = headerBands
+        .filter((candidate) => {
+          const center = (candidate.rect[1] + candidate.rect[3]) / 2;
+          return center > y + 3 && center - y < 180;
+        })
+        .sort((a, b) => a.rect[1] - b.rect[1]);
+      const header = precedingHeaders[0] || followingHeaders[0];
       if (!header) continue;
 
       for (const number of numbers) {
@@ -369,7 +458,11 @@ function extractCells(pages: ExtractedPage[]) {
           90,
         );
         const labelCutoff = leftmostYear - Math.min(84, smallestYearGap * 1.08);
-        const labelInfo = leadingLabel(line, number, labelCutoff, page.lines[index - 1]);
+        const directLabelInfo = leadingLabel(line, number, labelCutoff, page.lines[index - 1]);
+        const structuralLabelInfo = directLabelInfo
+          ? null
+          : unlabeledTotalLabel(page, index, line, labelCutoff);
+        const labelInfo = directLabelInfo || structuralLabelInfo;
         const label = labelInfo?.text || "";
         const normalizedLabel = normalizeLabel(label);
         const value = parseSwedishNumber(number.text);
@@ -395,6 +488,7 @@ function extractCells(pages: ExtractedPage[]) {
           yearRect: nearest.token.rect,
           tableTitle: header.title,
           nearbyRows: nearbyRowLabels(page, index, labelCutoff),
+          structuralLabel: Boolean(structuralLabelInfo),
         });
       }
     }
@@ -405,7 +499,8 @@ function extractCells(pages: ExtractedPage[]) {
 function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
   const scored = candidates
     .map((candidate) => {
-      const label = labelSimilarity(
+      const damagedExact = damagedLabelEquivalent(cell.label, candidate.label);
+      const label = damagedExact ? 1 : labelSimilarity(
         cell.normalizedLabel,
         candidate.normalizedLabel,
         cell.label.includes("�") || candidate.label.includes("�"),
@@ -428,6 +523,8 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
         contextScore: section + title + proximity + table,
         titleScore: titleSimilarity,
         equal: Math.abs(cell.value - candidate.value) < 0.000001,
+        exactLabel: cell.normalizedLabel === candidate.normalizedLabel || damagedExact,
+        damagedExact,
       };
     })
     .filter((item) => item.labelScore >= 0.62)
@@ -440,7 +537,17 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
       Math.abs(item.candidate.relativePage - cell.relativePage) < 0.24 &&
       item.labelScore >= 0.8,
   );
-  const best = equalMatch || scored[0];
+  const exactEqualCandidates = scored.filter((item) =>
+    item.exactLabel &&
+    item.equal &&
+    Math.abs(item.candidate.relativePage - cell.relativePage) < 0.24,
+  );
+  // An exact occurrence label with one agreeing value is safe to verify even
+  // when a note moved by a page or its extracted table heading is weak. This
+  // deliberately cannot create red: unequal or duplicate occurrences still
+  // require the stricter same-table proof below.
+  const uniqueExactEqual = exactEqualCandidates.length === 1 ? exactEqualCandidates[0] : undefined;
+  const best = equalMatch || uniqueExactEqual || scored[0];
   if (!best) return undefined;
   const plausible = scored.filter(
     (item) =>
@@ -449,21 +556,25 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
       item.titleScore >= 0.68 &&
       Math.abs(item.candidate.relativePage - cell.relativePage) < 0.2,
   );
-  const exactCandidates = scored.filter((item) => item.labelScore === 1);
-  const secondExact = exactCandidates.find((item) => item.candidate.id !== best.candidate.id);
+  const exactCandidates = scored.filter((item) => item.exactLabel);
+  const sameTable = (candidate: ComparableCell) => sameTableContext(cell, candidate);
+  const exactSameContext = exactCandidates.filter((item) => sameTable(item.candidate));
   const confidentMismatch =
-    best.labelScore === 1 &&
-    best.candidate.section === cell.section &&
-    best.titleScore >= 0.72 &&
+    best.exactLabel &&
+    !cell.structuralLabel &&
+    !best.candidate.structuralLabel &&
+    sameTable(best.candidate) &&
     Math.abs(best.candidate.relativePage - cell.relativePage) < 0.18 &&
-    (!secondExact || best.contextScore - secondExact.contextScore >= 0.2);
+    exactSameContext.length === 1;
   return {
     ...best,
     // Equal, contextually plausible values are safe to mark green even when a
     // label repeats. Unequal duplicates remain unresolved unless one alignment
     // is uniquely stronger than the alternatives.
-    ambiguous: !equalMatch && plausible.length > 1 && !confidentMismatch,
+    ambiguous: !equalMatch && !uniqueExactEqual && plausible.length > 1 && !confidentMismatch,
     confidentMismatch,
+    candidateCount: plausible.length || scored.length,
+    sameTableContext: sameTable(best.candidate),
   };
 }
 
@@ -502,6 +613,62 @@ function arithmeticEqual(left: number, right: number) {
   return Math.abs(left - right) < 0.000001;
 }
 
+function nearbyContextSimilarity(a: ComparableCell, b: ComparableCell) {
+  const words = (cell: ComparableCell) => new Set(
+    cell.nearbyRows
+      .flatMap((label) => normalizeLabel(label).split(" "))
+      .filter((word) => word.length >= 3),
+  );
+  const left = words(a);
+  const right = words(b);
+  if (!left.size || !right.size) return 0;
+  const intersection = [...left].filter((word) => right.has(word)).length;
+  return intersection / new Set([...left, ...right]).size;
+}
+
+function isBareResidualLabel(cell: ComparableCell) {
+  return new Set(["ovrigt", "ovriga", "other", "miscellaneous"]).has(cell.normalizedLabel);
+}
+
+function buildDirectEqualityProposals(
+  unresolved: Array<{ cell: ComparableCell; match: ReturnType<typeof bestCandidate> }>,
+  olderCandidates: ComparableCell[],
+  protectedOlderIds: Set<string>,
+) {
+  const proposals: DeterministicProposal[] = [];
+  const seen = new Set<string>();
+  for (const { cell } of unresolved) {
+    const candidates = olderCandidates
+      .filter((candidate) => {
+        if (
+          candidate.year !== cell.year ||
+          protectedOlderIds.has(candidate.id) ||
+          candidate.value === 0 ||
+          !arithmeticEqual(cell.value, candidate.value)
+        ) return false;
+        const pageDistance = Math.abs(candidate.page - cell.page);
+        return sameTableContext(cell, candidate) ||
+          (pageDistance <= 1 && candidate.tableIndex === cell.tableIndex) ||
+          (pageDistance <= 2 && nearbyContextSimilarity(cell, candidate) >= 0.34);
+      })
+      .sort((a, b) =>
+        Number(sameTableContext(cell, b)) - Number(sameTableContext(cell, a)) ||
+        nearbyContextSimilarity(cell, b) - nearbyContextSimilarity(cell, a) ||
+        labelSimilarity(cell.normalizedLabel, b.normalizedLabel) -
+          labelSimilarity(cell.normalizedLabel, a.normalizedLabel) ||
+        Math.abs(a.page - cell.page) - Math.abs(b.page - cell.page),
+      )
+      .slice(0, 3);
+    for (const candidate of candidates) {
+      const signature = mappingSignature([cell.id], [candidate.id]);
+      if (seen.has(signature)) continue;
+      seen.add(signature);
+      proposals.push({ newerIds: [cell.id], olderIds: [candidate.id], relationship: "direct" });
+    }
+  }
+  return proposals;
+}
+
 function subsetsOfSize<T>(items: T[], size: number, limit: number) {
   const results: T[][] = [];
   const visit = (start: number, selected: T[]) => {
@@ -524,18 +691,20 @@ function buildArithmeticProposals(
   olderCandidates: ComparableCell[],
   protectedOlderIds: Set<string>,
 ) {
-  const proposals: ArithmeticProposal[] = [];
+  const proposals: DeterministicProposal[] = [];
   const seen = new Set<string>();
+  const maxForwardProposals = unresolved.length * 3;
+  const maxTotalProposals = 80;
 
   for (const { cell, match } of unresolved) {
-    if (proposals.length >= 80) break;
     const title = normalizeLabel(cell.tableTitle);
     const pool = olderCandidates
       .filter((candidate) =>
         candidate.year === cell.year &&
         !protectedOlderIds.has(candidate.id) &&
         candidate.value !== 0 &&
-        labelSimilarity(title, normalizeLabel(candidate.tableTitle)) >= 0.65 &&
+        (labelSimilarity(title, normalizeLabel(candidate.tableTitle)) >= 0.65 ||
+          arithmeticContextCompatible(cell, candidate)) &&
         Math.abs(candidate.relativePage - cell.relativePage) < 0.2,
       )
       .sort((a, b) =>
@@ -562,24 +731,30 @@ function buildArithmeticProposals(
         seen.add(signature);
         proposals.push({ newerIds: [cell.id], olderIds, relationship: "aggregate" });
         proposalsForCell += 1;
-        if (proposalsForCell >= 6 || proposals.length >= 80) break;
+        if (proposalsForCell >= 3) break;
       }
-      if (proposalsForCell >= 6 || proposals.length >= 80) break;
+      if (proposalsForCell >= 3) break;
     }
   }
+
+  // With batches of at most 20 rows, three proposals per row leaves every row
+  // a fair chance before the request-level cap is used for inverse groups.
+  if (proposals.length > maxForwardProposals) proposals.splice(maxForwardProposals);
 
   // Search the inverse direction as well: several rows in the newer report may
   // have replaced one combined row in the older report. These groups are still
   // bounded and proven numerically before the model sees their IDs.
+  const inverseCoveredNewerIds = new Set<string>();
   for (const older of olderCandidates) {
-    if (proposals.length >= 80) break;
+    if (proposals.length >= maxTotalProposals) break;
     if (protectedOlderIds.has(older.id) || older.value === 0) continue;
     const pool = unresolved
       .map(({ cell }) => cell)
       .filter((cell) =>
         cell.year === older.year &&
         cell.value !== 0 &&
-        labelSimilarity(normalizeLabel(cell.tableTitle), normalizeLabel(older.tableTitle)) >= 0.65 &&
+        (labelSimilarity(normalizeLabel(cell.tableTitle), normalizeLabel(older.tableTitle)) >= 0.65 ||
+          arithmeticContextCompatible(cell, older)) &&
         Math.abs(cell.relativePage - older.relativePage) < 0.2,
       )
       .sort((a, b) =>
@@ -594,6 +769,7 @@ function buildArithmeticProposals(
       for (const selected of subsetsOfSize(pool, size, 1500)) {
         const total = selected.reduce((sum, candidate) => sum + candidate.value, 0);
         if (!arithmeticEqual(total, older.value)) continue;
+        if (selected.every((candidate) => inverseCoveredNewerIds.has(candidate.id))) continue;
         const newerIds = [...selected]
           .sort((a, b) => a.page - b.page || a.token.rect[1] - b.token.rect[1])
           .map((candidate) => candidate.id);
@@ -601,10 +777,11 @@ function buildArithmeticProposals(
         if (seen.has(signature)) continue;
         seen.add(signature);
         proposals.push({ newerIds, olderIds: [older.id], relationship: "aggregate" });
+        newerIds.forEach((id) => inverseCoveredNewerIds.add(id));
         proposalsForCell += 1;
-        if (proposalsForCell >= 6 || proposals.length >= 80) break;
+        if (proposalsForCell >= 1 || proposals.length >= maxTotalProposals) break;
       }
-      if (proposalsForCell >= 6 || proposals.length >= 80) break;
+      if (proposalsForCell >= 1 || proposals.length >= maxTotalProposals) break;
     }
   }
   return proposals;
@@ -673,23 +850,47 @@ export async function analyzePair(
     cell,
     match: bestCandidate(cell, olderByYear.get(cell.year) || []),
   }));
+  const counterpartClaims = new Map<string, Array<(typeof preliminary)[number]>>();
+  for (const item of preliminary) {
+    if (item.match && !item.match.ambiguous) {
+      const claims = counterpartClaims.get(item.match.candidate.id) || [];
+      claims.push(item);
+      counterpartClaims.set(item.match.candidate.id, claims);
+    }
+  }
+  const collidingNewerIds = new Set<string>();
+  for (const claims of counterpartClaims.values()) {
+    if (claims.length < 2) continue;
+    const exactSameTableClaims = claims.filter((item) =>
+      item.match?.exactLabel && item.match.sameTableContext,
+    );
+    const collisions = exactSameTableClaims.length === 1
+      ? claims.filter((item) => item !== exactSameTableClaims[0])
+      : claims;
+    collisions.forEach((item) => collidingNewerIds.add(item.cell.id));
+  }
+  const hasCounterpartCollision = (item: (typeof preliminary)[number]) =>
+    collidingNewerIds.has(item.cell.id);
   const unresolved = preliminary.filter(
-    (item) => !item.match || !item.match.equal || item.match.ambiguous,
+    (item) => !item.match || !item.match.equal || item.match.ambiguous || hasCounterpartCollision(item),
   );
   const protectedOlderIds = new Set(
     preliminary
-      .filter((item) => item.match?.equal && !item.match.ambiguous)
+      .filter((item) => item.match?.equal && !item.match.ambiguous && !hasCounterpartCollision(item))
       .map((item) => item.match!.candidate.id),
   );
   const deterministicMismatchTargets = new Map(
     preliminary
-      .filter((item) => item.match?.confidentMismatch)
+      .filter((item) => item.match?.confidentMismatch && !hasCounterpartCollision(item))
       .map((item) => [item.cell.id, item.match!.candidate.id]),
   );
   const mappings: ModelMapping[] = [];
+  let batchesAttempted = 0;
+  let batchesFailed = 0;
+  let mappingsRejected = 0;
 
   if (unresolved.length && options?.resolveLabels) {
-    const batchSize = 40;
+    const batchSize = 20;
     const batches = Array.from(
       { length: Math.ceil(unresolved.length / batchSize) },
       (_, index) => unresolved.slice(index * batchSize, (index + 1) * batchSize),
@@ -697,11 +898,12 @@ export async function analyzePair(
     const newerById = new Map(newerCells.map((cell) => [cell.id, cell]));
     const olderById = new Map(olderCells.map((cell) => [cell.id, cell]));
     const usedNewer = new Set<string>();
-    const usedOlder = new Set<string>();
+    const usedOlder = new Set<string>(protectedOlderIds);
 
     for (const [batchIndex, batch] of batches.entries()) {
       const newerRows = batch.map((item) => toModelRow(item.cell));
       const olderCandidates = new Map<string, ComparableCell>();
+      const candidateLists: ComparableCell[][] = [];
       for (const { cell } of batch) {
         const candidates = (olderByYear.get(cell.year) || [])
           .filter(
@@ -719,22 +921,69 @@ export async function analyzePair(
                 Math.abs(b.relativePage - cell.relativePage),
           )
           .slice(0, 40);
+        candidateLists.push(candidates);
         for (const candidate of candidates) olderCandidates.set(candidate.id, candidate);
       }
-      const olderCandidateCells = [...olderCandidates.values()].slice(0, 160);
+      const directDiscoveryPool = [...new Map(
+        batch.flatMap(({ cell }) => (olderByYear.get(cell.year) || []).map((candidate) => [candidate.id, candidate] as const)),
+      ).values()];
+      const discoveredDirect = buildDirectEqualityProposals(batch, directDiscoveryPool, protectedOlderIds);
+      for (const proposal of discoveredDirect) {
+        for (const id of proposal.olderIds) {
+          const candidate = olderById.get(id);
+          if (candidate) olderCandidates.set(id, candidate);
+        }
+      }
+      const contextualOlderCells = [...olderCandidates.values()];
+      const discoveredGroups = [
+        ...discoveredDirect,
+        ...buildArithmeticProposals(batch, contextualOlderCells, protectedOlderIds),
+      ].slice(0, 80);
+      const selectedOlderIds = new Set<string>();
+      const candidateLimit = 160;
+
+      // Always retain the deterministic anchor for each unresolved row. Then
+      // reserve every member of as many exact arithmetic proposals as fit. The
+      // remaining prompt budget is filled round-robin across rows so later
+      // pages in a batch cannot be starved by earlier candidate lists.
+      for (const item of batch) {
+        if (item.match?.candidate.id && selectedOlderIds.size < candidateLimit) {
+          selectedOlderIds.add(item.match.candidate.id);
+        }
+      }
+      const proposedGroups: DeterministicProposal[] = [];
+      for (const group of discoveredGroups) {
+        const additionalIds = group.olderIds.filter((id) => !selectedOlderIds.has(id));
+        if (selectedOlderIds.size + additionalIds.length > candidateLimit) continue;
+        additionalIds.forEach((id) => selectedOlderIds.add(id));
+        proposedGroups.push(group);
+      }
+      for (let rank = 0; rank < 40 && selectedOlderIds.size < candidateLimit; rank += 1) {
+        for (const candidates of candidateLists) {
+          const candidate = candidates[rank];
+          if (candidate) selectedOlderIds.add(candidate.id);
+          if (selectedOlderIds.size >= candidateLimit) break;
+        }
+      }
+      const olderCandidateCells = [...selectedOlderIds]
+        .map((id) => olderCandidates.get(id))
+        .filter(Boolean) as ComparableCell[];
       const olderRows = olderCandidateCells.map(toModelRow);
-      const proposedGroups = buildArithmeticProposals(batch, olderCandidateCells, protectedOlderIds);
       if (!newerRows.length || !olderRows.length) continue;
+      batchesAttempted += 1;
 
       const batchLabel = batches.length > 1 ? ` (batch ${batchIndex + 1}/${batches.length})` : "";
       options.onProgress?.(
         0.9 + ((batchIndex + 1) / batches.length) * 0.07,
-        (proposedGroups.length
+        (proposedGroups.some((group) => group.relationship === "aggregate")
           ? "Validating arithmetic row groups with the selected model"
           : "Resolving renamed rows with the selected model") + batchLabel,
       );
       try {
-        const response = await options.resolveLabels(newerRows, olderRows, proposedGroups);
+        const response = await options.resolveLabels(newerRows, olderRows, proposedGroups, {
+          index: batchIndex + 1,
+          count: batches.length,
+        });
         const validNewerIds = new Set(newerRows.map((row) => row.id));
         const validOlderIds = new Set(olderRows.map((row) => row.id));
         const proposedSignatures = new Set(
@@ -782,13 +1031,89 @@ export async function analyzePair(
             !isApprovedProposal ||
             !arithmeticAgrees ||
             !preservesDeterministicMismatch
-          ) continue;
+          ) {
+            mappingsRejected += 1;
+            continue;
+          }
           mappedNewerIds.forEach((id) => usedNewer.add(id));
           mappedOlderIds.forEach((id) => usedOlder.add(id));
           mappings.push({ ...mapping, newerIds: mappedNewerIds, olderIds: mappedOlderIds });
         }
       } catch {
+        batchesFailed += 1;
         // Continue through later batches; deterministic results remain valid and unresolved cells stay gray.
+      }
+
+      // A broad residual label can legitimately replace one specific category,
+      // but that judgment is easily lost in a large candidate prompt. Retry only
+      // the still-unresolved, deterministically equal residual-to-specific pairs
+      // once, with their existing structural context and no unrelated rows.
+      const focusedResidualProposals = proposedGroups.filter((proposal) => {
+        if (proposal.relationship !== "direct" || proposal.newerIds.length !== 1 || proposal.olderIds.length !== 1) {
+          return false;
+        }
+        const newer = newerById.get(proposal.newerIds[0]);
+        const older = olderById.get(proposal.olderIds[0]);
+        return Boolean(
+          newer && older &&
+          !usedNewer.has(newer.id) &&
+          !usedOlder.has(older.id) &&
+          isBareResidualLabel(newer) !== isBareResidualLabel(older),
+        );
+      });
+      if (focusedResidualProposals.length) {
+        const focusedNewer = [...new Map(
+          focusedResidualProposals.map((proposal) => {
+            const cell = newerById.get(proposal.newerIds[0])!;
+            return [cell.id, toModelRow(cell)] as const;
+          }),
+        ).values()];
+        const focusedOlder = [...new Map(
+          focusedResidualProposals.map((proposal) => {
+            const cell = olderById.get(proposal.olderIds[0])!;
+            return [cell.id, toModelRow(cell)] as const;
+          }),
+        ).values()];
+        const allowedSignatures = new Set(
+          focusedResidualProposals.map((proposal) => mappingSignature(proposal.newerIds, proposal.olderIds)),
+        );
+        batchesAttempted += 1;
+        options.onProgress?.(
+          0.9 + ((batchIndex + 1) / batches.length) * 0.07,
+          `Rechecking a contextual residual mapping${batchLabel}`,
+        );
+        try {
+          const response = await options.resolveLabels(focusedNewer, focusedOlder, focusedResidualProposals, {
+            index: batchIndex + 1,
+            count: batches.length,
+          });
+          for (const mapping of response.mappings || []) {
+            const newerIds = [...new Set((mapping.newerIds || []).map(String))];
+            const olderIds = [...new Set((mapping.olderIds || []).map(String))];
+            if (mapping.relationship === "none") continue;
+            const signature = mappingSignature(newerIds, olderIds);
+            const newer = newerIds.length === 1 ? newerById.get(newerIds[0]) : undefined;
+            const older = olderIds.length === 1 ? olderById.get(olderIds[0]) : undefined;
+            const deterministicTarget = newer ? deterministicMismatchTargets.get(newer.id) : undefined;
+            if (
+              mapping.relationship !== "direct" ||
+              !allowedSignatures.has(signature) ||
+              !newer || !older ||
+              usedNewer.has(newer.id) || usedOlder.has(older.id) ||
+              newer.year !== older.year ||
+              !arithmeticEqual(newer.value, older.value) ||
+              (deterministicTarget && deterministicTarget !== older.id)
+            ) {
+              mappingsRejected += 1;
+              continue;
+            }
+            usedNewer.add(newer.id);
+            usedOlder.add(older.id);
+            mappings.push({ ...mapping, newerIds, olderIds });
+          }
+        } catch {
+          batchesFailed += 1;
+        }
       }
     }
   }
@@ -826,9 +1151,8 @@ export async function analyzePair(
         const exactAlignedDirect = mapping.relationship === "direct" &&
           newerGroup.length === 1 &&
           olderGroup.length === 1 &&
-          newerGroup[0].normalizedLabel === olderGroup[0].normalizedLabel &&
           match?.candidate.id === olderGroup[0].id &&
-          match.labelScore === 1 &&
+          match.exactLabel &&
           match.confidentMismatch &&
           !match.ambiguous;
         const operator = equal ? "=" : "≠";
@@ -860,6 +1184,29 @@ export async function analyzePair(
                 olderTerms: olderGroup.map((item) => ({ label: item.label, value: item.valueText })),
               }
             : undefined,
+          evidence: {
+            reason: isArithmetic
+              ? "aggregate-equal"
+              : equal
+                ? "model-equal"
+                : exactAlignedDirect
+                  ? "exact-unequal"
+                  : "model-unequal",
+            verdict: equal ? "verified" : exactAlignedDirect ? "discrepancy" : "review",
+            labelAlignment: isArithmetic
+              ? "semantic"
+              : exactAlignedDirect
+                ? match?.damagedExact ? "damaged-text" : "exact"
+                : mapping.relationship === "direct" ? "semantic" : "weak",
+            contextAlignment: match?.sameTableContext ? "same-table" : "compatible",
+            uniqueCounterpart: mapping.newerIds.length === 1 && mapping.olderIds.length === 1,
+            candidateCount: match?.candidateCount || olderGroup.length,
+            deterministic: true,
+            normalizedNewer: newerTotal,
+            normalizedOlder: olderTotal,
+            modelRole: isArithmetic ? "arithmetic-coherence" : "rename",
+            modelReason: mapping.reason?.slice(0, 500),
+          },
         });
         continue;
       }
@@ -867,13 +1214,16 @@ export async function analyzePair(
 
     const source = match?.candidate;
     const method: Discrepancy["matchMethod"] = match
-      ? match.labelScore === 1 ? "exact" : "similar"
+      ? match.exactLabel && !match.damagedExact ? "exact" : "similar"
       : "none";
     const comparedValue = source?.value ?? null;
     const equal = comparedValue !== null && Math.abs(cell.value - comparedValue) < 0.000001;
     const uncertain = Boolean(match?.ambiguous);
+    const counterpartReused = hasCounterpartCollision({ cell, match });
     const status: Discrepancy["status"] = comparedValue === null
       ? "missing"
+      : counterpartReused
+        ? "missing"
       : equal
         ? "match"
         : match?.confidentMismatch && !uncertain
@@ -889,9 +1239,51 @@ export async function analyzePair(
       valueNew: cell.valueText,
       valueOld: source?.valueText,
       matchMethod: method,
-      explanation: describe(status, cell, source, source?.valueText, comparedValue !== null && status === "missing"),
+      explanation: counterpartReused
+        ? `${cell.year}: this prior-report occurrence was claimed by more than one newer row, so the alignment was not judged.`
+        : status === "match" && (cell.structuralLabel || source?.structuralLabel)
+          ? `${cell.year}: the unlabeled numeric row immediately below a horizontal total rule agrees with the corresponding ruled row in the prior report (${source?.valueText}).`
+        : describe(status, cell, source, source?.valueText, comparedValue !== null && status === "missing"),
       newer: evidence(cell),
       older: source ? evidence(source) : undefined,
+      evidence: {
+        reason: status === "mismatch"
+          ? "exact-unequal"
+          : counterpartReused
+            ? "counterpart-reused"
+            : status === "match"
+              ? cell.structuralLabel || source?.structuralLabel
+                ? "structural-equal"
+                : cell.label.includes("�") || source?.label.includes("�")
+                  ? "damaged-text-equal"
+                  : "exact-equal"
+              : uncertain
+                ? "ambiguous-counterpart"
+                : source
+                  ? "weak-counterpart"
+                  : "no-counterpart",
+        verdict: status === "match" ? "verified" : status === "mismatch" ? "discrepancy" : "review",
+        labelAlignment: cell.structuralLabel || source?.structuralLabel
+          ? "structural"
+          : match?.exactLabel && !match.damagedExact
+            ? "exact"
+          : cell.label.includes("�") || source?.label.includes("�")
+            ? "damaged-text"
+            : match
+              ? "weak"
+              : "none",
+        contextAlignment: match?.sameTableContext
+          ? "same-table"
+          : match
+            ? "compatible"
+            : "none",
+        uniqueCounterpart: Boolean(match && !match.ambiguous && !counterpartReused),
+        candidateCount: match?.candidateCount || 0,
+        deterministic: true,
+        normalizedNewer: cell.value,
+        normalizedOlder: source?.value,
+        modelRole: "none",
+      },
     });
   }
 
@@ -909,5 +1301,20 @@ export async function analyzePair(
     olderYear,
     comparedCells: discrepancies.length,
     modelAssisted,
+    coverage: {
+      newerExtractedCells: allNewerCells.length,
+      olderExtractedCells: olderCells.length,
+      overlappingYearCells: newerCells.length,
+      verifiedCells: discrepancies.filter((item) => item.status === "match").length,
+      reviewCells: discrepancies.filter((item) => item.status === "missing").length,
+      discrepancyCells: discrepancies.filter((item) => item.status === "mismatch").length,
+    },
+    modelReview: {
+      enabled: Boolean(options?.resolveLabels),
+      batchesAttempted,
+      batchesFailed,
+      mappingsAccepted: mappings.length,
+      mappingsRejected,
+    },
   };
 }

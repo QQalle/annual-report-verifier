@@ -343,9 +343,9 @@ export function PdfViewer({
     });
   };
 
-  const mismatchMarkers = useMemo(
+  const findingMarkers = useMemo(
     () => highlights.flatMap((highlight) => {
-      if (highlight.status !== "mismatch") return [];
+      if (highlight.status !== "mismatch" && !highlight.arithmetic) return [];
       const target = targetsFor(highlight, highlightSide)[0];
       return target ? [{ highlight, target }] : [];
     }),
@@ -418,16 +418,16 @@ export function PdfViewer({
             ))}
           </div>
         )}
-        {pdf && mismatchMarkers.length > 0 && (
-          <div className="scroll-markers" aria-label="Discrepancy positions">
-            {mismatchMarkers.map(({ highlight, target }) => (
+        {pdf && findingMarkers.length > 0 && (
+          <div className="scroll-markers" aria-label="Discrepancy and regrouping positions">
+            {findingMarkers.map(({ highlight, target }) => (
               <button
                 key={`marker-${highlight.id}`}
                 type="button"
-                className="scroll-marker mismatch"
+                className={`scroll-marker ${highlight.arithmetic ? "arithmetic" : "mismatch"}`}
                 style={{ top: `${((target.page + 0.5) / pdf.pageCount) * 100}%` }}
                 onClick={() => onHighlightActivate?.(highlight, target)}
-                aria-label={`Go to discrepancy: ${highlight.labelNew}`}
+                aria-label={`Go to ${highlight.arithmetic ? "regrouping" : "discrepancy"}: ${highlight.labelNew}`}
                 title={highlight.labelNew}
               />
             ))}

@@ -12,6 +12,12 @@ async function render(path) {
   );
 }
 
+test("root starts at the analyzer", async () => {
+  const response = await render("/");
+  assert.equal(response.status, 307);
+  assert.equal(new URL(response.headers.get("location"), "http://localhost").pathname, "/analyze");
+});
+
 test("server-renders the report library", async () => {
   const response = await render("/library");
   assert.equal(response.status, 200);
@@ -19,8 +25,8 @@ test("server-renders the report library", async () => {
   const html = await response.text();
   assert.match(html, /Report library/);
   assert.match(html, /Upload your own pair/);
-  assert.match(html, /Second Pass/);
-  assert.match(html, /Model setup/);
+  assert.match(html, /Third Pass/);
+  assert.match(html, /Model audit/);
 });
 
 test("server-renders the analyzer", async () => {
