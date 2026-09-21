@@ -78,6 +78,20 @@ export type ArithmeticCheck = {
   olderTerms: Array<{ label: string; value: string }>;
 };
 
+export type ControlJudgment = {
+  basis: "deterministic" | "jev";
+  score?: number;
+  confidence?: number;
+  outcomeProbability?: number;
+  probabilities?: Record<string, number>;
+  components?: Array<{
+    name: string;
+    score: number;
+    confidence: number;
+    probabilities: Record<string, number>;
+  }>;
+};
+
 export type Discrepancy = {
   id: string;
   status: DiscrepancyStatus;
@@ -94,6 +108,7 @@ export type Discrepancy = {
   newerRelated?: EvidenceTarget[];
   olderRelated?: EvidenceTarget[];
   arithmetic?: ArithmeticCheck;
+  judgment: ControlJudgment;
 };
 
 export type NumberHighlight = { page: number; rect: Rect; tokenId: string };

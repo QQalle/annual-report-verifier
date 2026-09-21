@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleDashed,
+  Equal,
   Link2,
   LoaderCircle,
   ScanSearch,
@@ -17,7 +18,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useModel } from "@/lib/model-context";
 import { analyzePair } from "@/lib/compare";
 import { BrowserPdf, detectReportYear } from "@/lib/pdf-engine";
-import type { AnalysisResult, Discrepancy, EvidenceTarget } from "@/lib/types";
+import type { AnalysisResult, ControlJudgment, Discrepancy, EvidenceTarget } from "@/lib/types";
 import { PdfViewer } from "./PdfViewer";
 
 type Side = "newer" | "older";
@@ -217,6 +218,7 @@ export function AnalyzeWorkspace() {
                   newerIds: string[];
                   olderIds: string[];
                   relationship: "direct" | "aggregate" | "none";
+                  judgment?: ControlJudgment;
                 }>;
               }>
           : undefined,
@@ -236,10 +238,14 @@ export function AnalyzeWorkspace() {
 
   const counts = analysis
     ? analysis.discrepancies.reduce(
-        (sum, item) => ({ ...sum, [item.status]: sum[item.status] + 1 }),
-        { match: 0, mismatch: 0, missing: 0 },
+        (sum, item) => ({
+          ...sum,
+          [item.status]: sum[item.status] + 1,
+          arithmetic: sum.arithmetic + Number(item.status === "match" && Boolean(item.arithmetic)),
+        }),
+        { match: 0, mismatch: 0, missing: 0, arithmetic: 0 },
       )
-    : { match: 0, mismatch: 0, missing: 0 };
+    : { match: 0, mismatch: 0, missing: 0, arithmetic: 0 };
 
   const issueList = useMemo(
     () =>
@@ -307,7 +313,8 @@ export function AnalyzeWorkspace() {
       {analysis && (
         <div className="analysis-summary">
           <div className="result-counts">
-            <span className="result-stat match"><CheckCircle2 size={14} /><strong>{counts.match}</strong> match</span>
+            <span className="result-stat match"><CheckCircle2 size={14} /><strong>{counts.match - counts.arithmetic}</strong> match</span>
+            <span className="result-stat arithmetic"><Equal size={14} /><strong>{counts.arithmetic}</strong> reconciled</span>
             <span className="result-stat mismatch"><AlertTriangle size={14} /><strong>{counts.mismatch}</strong> discrepancies</span>
             <span className="result-stat missing"><CircleDashed size={14} /><strong>{counts.missing}</strong> no counterpart</span>
           </div>

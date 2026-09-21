@@ -337,6 +337,50 @@ test("matches an equal row when the prior PDF text layer has a damaged glyph", a
   assert.equal(result.discrepancies[0].status, "match");
 });
 
+test("a unique unequal row remains red when the prior PDF text layer has damaged glyphs", async () => {
+  const newer = [reportPage(0, [2024, 2023], [{
+    label: "Årsavgift per kvm upplåten bostadsrätt, kr",
+    values: [800, 693],
+  }])];
+  const older = [reportPage(0, [2023, 2022], [{
+    label: "Årsavgi� per kvm upplåten bostadsrä�, kr",
+    values: [692, 600],
+  }])];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].valueNew, "693");
+  assert.equal(result.discrepancies[0].valueOld, "692");
+  assert.equal(result.discrepancies[0].judgment.basis, "deterministic");
+});
+
+test("a row above the next note header stays owned by its preceding table", () => {
+  const first = reportPage(0, [2024, 2023], [{
+    label: "Bankkostnader",
+    values: [6798, 6348],
+  }], {
+    title: "NOT 8, ÖVRIGA EXTERNA KOSTNADER",
+    inlineTitle: true,
+    headerY: 50,
+    rowStart: 145,
+  });
+  const second = reportPage(1, [2024, 2023], [], {
+    title: "NOT 9, PERSONALKOSTNADER",
+    inlineTitle: true,
+    headerY: 170,
+  });
+  const combined: ExtractedPage = {
+    ...first,
+    lines: [...first.lines, ...second.lines],
+    tokens: [...first.tokens, ...second.tokens],
+    text: [...first.lines, ...second.lines].map((line) => line.text).join("\n"),
+  };
+
+  const bankCells = extractCells([combined]).filter((cell) => cell.label === "Bankkostnader");
+  assert.equal(bankCells.length, 2);
+  assert.ok(bankCells.every((cell) => cell.tableTitle === "NOT 8, ÖVRIGA EXTERNA KOSTNADER"));
+});
+
 test("keeps values that happen to look like calendar years", async () => {
   const newer = [reportPage(0, [2025, 2024], [{ label: "Driftskostnad", values: [3000, 2024] }])];
   const older = [reportPage(0, [2024, 2023], [{ label: "Driftskostnad", values: [2024, 1900] }])];
@@ -465,6 +509,33 @@ test("residual Övrigt labels can map to a specific renamed key using note conte
   assert.equal(residual?.matchMethod, "model");
 });
 
+test("an unequal residual label cannot become red and does not hide an equal renamed row", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Övrigt", values: [130, 100] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Övrigt", values: [99, 70] },
+    { label: "Klottersanering", values: [100, 60] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => {
+      const residual = newerRows.find((row) => row.label === "Övrigt");
+      const renamed = olderRows.find((row) => row.label === "Klottersanering");
+      assert.ok(residual && renamed);
+      return { mappings: [{
+        newerIds: [residual.id],
+        olderIds: [renamed.id],
+        relationship: "direct",
+      }] };
+    },
+  });
+
+  assert.equal(result.discrepancies[0].status, "match");
+  assert.equal(result.discrepancies[0].labelOld, "Klottersanering");
+  assert.equal(result.discrepancies[0].matchMethod, "model");
+});
+
 test("Jev questions isolate semantic judgments and keep values out of state", () => {
   const newerRows = [{
     id: "new-1", label: "Övrigt", section: "Notes", year: 2024, page: 9, table: 1,
@@ -487,7 +558,7 @@ test("Jev questions isolate semantic judgments and keep values out of state", ()
   assert.equal(Object.keys(definition.request.questions).length, 1);
 });
 
-test("Jev mappings accept only unique top-level semantic outcomes", () => {
+test("Jev mappings reject ambiguous direct pairs and retain aggregate confidence", () => {
   const scoreAnswer = (value: number) => ({
     type: "score" as const,
     score: value,
@@ -506,13 +577,55 @@ test("Jev mappings accept only unique top-level semantic outcomes", () => {
       direct_0: scoreAnswer(1.8),
       direct_1: scoreAnswer(1.7),
       direct_2: scoreAnswer(1.6),
-      aggregate_0: scoreAnswer(1.9),
+      aggregate_concept_0: scoreAnswer(1.9),
+      aggregate_structure_0: scoreAnswer(1.8),
     },
   );
-  assert.deepEqual(result.mappings, [
+  assert.deepEqual(result.mappings.map(({ newerIds, olderIds, relationship }) => ({
+    newerIds,
+    olderIds,
+    relationship,
+  })), [
     { newerIds: ["new-3"], olderIds: ["old-4", "old-5"], relationship: "aggregate" },
     { newerIds: ["new-2"], olderIds: ["old-3"], relationship: "direct" },
   ]);
+  assert.equal(result.mappings[0].judgment?.basis, "jev");
+  assert.equal(result.mappings[0].judgment?.confidence, 0.8);
+  assert.equal(result.mappings[0].judgment?.components?.length, 2);
+});
+
+test("a low-confidence aggregate is approved only when coherent is the dominant outcome", () => {
+  const answer = (
+    scoreValue: number,
+    confidence: number,
+    distribution: Record<string, number>,
+  ) => ({
+    type: "score" as const,
+    score: scoreValue,
+    confidence,
+    probabilities: distribution,
+    legend: { 0: "incoherent", 1: "uncertain", 2: "coherent" },
+  });
+  const result = mappingsFromTypeSafe(
+    [],
+    [{
+      newerIds: ["new-1"],
+      olderIds: ["old-1", "old-2"],
+      relationship: "aggregate",
+      termQuestionIds: ["aggregate_term_0_older_1"],
+    }],
+    {
+      aggregate_concept_0: answer(1, 0, { 0: 0.2, 1: 0.6, 2: 0.2 }),
+      aggregate_structure_0: answer(1.3, 0.2, { 0: 0.2, 1: 0.3, 2: 0.5 }),
+      aggregate_term_0_older_1: answer(1.2, 0, { 0: 0.25, 1: 0.3, 2: 0.45 }),
+    },
+  );
+
+  assert.equal(result.mappings.length, 1);
+  assert.equal(result.mappings[0].judgment?.confidence, 0);
+  assert.equal(result.mappings[0].judgment?.outcomeProbability, 0.435);
+  assert.equal(result.mappings[0].judgment?.probabilities?.["2"], 0.435);
+  assert.equal("termQuestionIds" in result.mappings[0], false);
 });
 
 test("model-assisted split rows are checked arithmetically and grouped", async () => {

@@ -41,12 +41,14 @@ npm run dev
 
 You can also copy `.env.example` to `.env.local`. Environment files are ignored by Git. Keys pasted in the UI stay only in React memory for the current tab, are sent only to the local `/api/model` route, and are never included in the call log or browser storage.
 
-The sidebar defaults to the pinned `jev-1.13.0` release for reproducible audits; `jev-latest` is also available. Jev receives typed Score questions for two narrow semantic judgments:
+The sidebar defaults to the pinned `jev-1.13.0` release for reproducible audits; `jev-latest` is also available. Jev receives typed Score questions for narrow semantic judgments:
 
 1. whether one bounded newer/older row pair is the same reported financial concept;
-2. whether a deterministically equal group is a coherent split or merge.
+2. whether a deterministically equal group is one complete accounting concept;
+3. whether the local table structure supports a reclassification; and
+4. whether each newly appearing or disappearing term plausibly belongs inside the retained broader row.
 
-Each Score has explicit `different`, `uncertain`, and `same/coherent` levels. Only the top level can produce a mapping. If more than one candidate reaches that level for either occurrence, the app rejects the competing mappings and leaves the row gray. Jev never receives numeric values and never decides numeric equality. Candidate retrieval, exact totals, occurrence uniqueness, cross-year validation, and the red/gray policy all remain deterministic. The sidebar is the source of truth for actual token use in a session.
+Each Score has explicit `different`, `uncertain`, and `same/coherent` levels. Only a uniquely dominant top outcome can produce a mapping. If competing direct candidates have similar approval probability, the app rejects them and leaves the row gray. Jev never receives numeric values and never decides numeric equality. Candidate retrieval, exact totals, occurrence uniqueness, cross-year validation, and the red/gray policy all remain deterministic. Blue controls show both the probability assigned to the approved outcome and TypeSafe confidence; confidence measures concentration of the distribution, not correctness. The sidebar is the source of truth for actual token use in a session.
 
 ## Token spend
 
@@ -58,10 +60,10 @@ MuPDF reads each page's text and character coordinates in the same structured-te
 
 The analyzer:
 
-1. detects table header years and assigns numeric cells to the nearest year column;
+1. detects table header years and assigns numeric cells to the nearest year column, preferring the preceding header so the next note cannot steal a final row;
 2. recognizes date-formatted headers and consecutive multi-year bands, including `NYCKELTAL` tables;
 3. excludes the newer report's current-year values;
-4. normalizes labels, note prefixes, units, Swedish separators, decimal commas, negatives, and English comma thousands;
+4. normalizes labels, note prefixes, units, Swedish separators, decimal commas, negatives, English comma thousands, and bounded damaged-glyph variants from imperfect PDF text layers;
 5. matches the same reported year using label, table title, section, table position, relative page, and numeric equality for disambiguation;
 6. asks Jev only about bounded unresolved row pairs or deterministic split/merge proposals when a key is configured;
 7. marks equal values green, Jev-approved arithmetic equalities blue, unique exact-context differences red, and missing or ambiguous counterparts gray.
@@ -70,13 +72,13 @@ The implementation covers year-column tables throughout the multi-year overview,
 
 ## Arithmetic split and merge checks
 
-The analyzer never asks Jev to do the arithmetic. For each unresolved value it searches compatible rows from the same reported year and nearby/table-matched context for exact equations of up to four terms, for example:
+The analyzer never asks Jev to do the arithmetic. Before applying the semantic direct-pair shortlist, it searches the full compatible table context for exact equations of up to four terms, for example:
 
 ```text
 68 908 = 59 645 + 2 465 + 6 798
 ```
 
-It protects prior rows already used by an unambiguous equal match, limits candidate combinations, and checks equality with deterministic numeric parsing. Only then does it show the candidate labels and context to Jev without values. Jev may approve the grouping only if the note heading and neighboring rows make the regrouping semantically coherent. The UI shows approved arithmetic comparisons in blue with the equation and all linked values in the tooltip. Unapproved or ambiguous proposals remain gray.
+It protects prior rows already used by an unambiguous equal match, limits candidate combinations, and checks equality with deterministic numeric parsing. Only then does it show the candidate labels and context to Jev without values. Separate concept, structure, and term-inclusion Scores are combined, with the narrow term judgments carrying the most weight. The UI shows approved arithmetic comparisons in blue with the equation, all linked values, outcome probability, and confidence in the tooltip. Unapproved or ambiguous proposals remain gray.
 
 Unresolved rows are reviewed in bounded batches so a later note cannot be skipped merely because an earlier section has many unresolved rows. Each batch is visible as its own audited model call.
 

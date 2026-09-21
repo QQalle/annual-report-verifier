@@ -2,6 +2,7 @@ import type { BrowserPdf } from "./pdf-engine";
 import { parseSwedishNumber } from "./pdf-engine";
 import type {
   AnalysisResult,
+  ControlJudgment,
   Discrepancy,
   EvidenceTarget,
   ExtractedPage,
@@ -44,6 +45,7 @@ type ModelMapping = {
   newerIds: string[];
   olderIds: string[];
   relationship: "direct" | "aggregate" | "none";
+  judgment?: ControlJudgment;
 };
 
 type ArithmeticProposal = {
@@ -104,6 +106,11 @@ const genericLabels = new Set([
   "total",
   "year",
 ]);
+const residualLabels = new Set(["ovrigt", "ovriga", "other", "miscellaneous"]);
+
+function isResidualLabel(label: string) {
+  return residualLabels.has(label);
+}
 
 export function normalizeLabel(label: string) {
   return label
@@ -151,6 +158,25 @@ function labelSimilarity(a: string, b: string, allowDamagedText = false) {
   return allowDamagedText ? Math.max(wordSimilarity, characterSimilarity(a, b)) : wordSimilarity;
 }
 
+function damagedLabelEquivalent(
+  leftText: string,
+  rightText: string,
+  leftNormalized: string,
+  rightNormalized: string,
+) {
+  if (!leftText.includes("�") && !rightText.includes("�")) return false;
+  const shorter = Math.min(leftNormalized.length, rightNormalized.length);
+  const longer = Math.max(leftNormalized.length, rightNormalized.length);
+  const leftWords = leftNormalized.split(" ");
+  const rightWords = rightNormalized.split(" ");
+  const alignedWords = leftWords.length === rightWords.length && leftWords.every((word, index) =>
+    word === rightWords[index] || characterSimilarity(word, rightWords[index]) >= 0.65,
+  );
+  const changedWords = leftWords.filter((word, index) => word !== rightWords[index]).length;
+  return shorter >= 12 && longer - shorter <= 4 && alignedWords && changedWords <= 2 &&
+    characterSimilarity(leftNormalized, rightNormalized) >= 0.86;
+}
+
 function pageSection(page: ExtractedPage) {
   const topText = page.lines
     .filter((line) => line.rect[1] < page.bounds[1] + (page.bounds[3] - page.bounds[1]) * 0.42)
@@ -195,11 +221,13 @@ function tableTitle(lines: PdfLine[], headerTop: number) {
     "sep", "september", "okt", "oct", "october", "nov", "november", "dec", "december",
   ]);
   const candidates = lines
-    .filter((line) => line.rect[3] <= headerTop + 3 && headerTop - line.rect[3] < 150)
+    .filter((line) => line.rect[1] <= headerTop + 8 && headerTop - line.rect[3] < 150)
     .filter((line) => {
       if (/^\s*\d{6}-?\d{4}\s*$/.test(line.text) || /årsredovisning|annual report/i.test(line.text)) {
         return false;
       }
+      const looksLikeNoteHeading = /^\s*(NOT|NOTE)\s*\d+/i.test(line.text);
+      if (!looksLikeNoteHeading && line.tokens.some((token) => token.isNumber)) return false;
       const words = line.tokens.filter((token) => yearFromToken(token) === null && !token.isNumber);
       const text = words.map((token) => token.text).join(" ");
       const informativeWords = normalizeLabel(text)
@@ -208,9 +236,11 @@ function tableTitle(lines: PdfLine[], headerTop: number) {
       return /[a-zåäö]/i.test(text) && informativeWords.length > 0;
     })
     .sort((a, b) => {
-      const aHeading = Number(/[A-ZÅÄÖ]{3}/.test(a.text) || /^\s*(NOT|NOTE)\s+\d+/i.test(a.text));
-      const bHeading = Number(/[A-ZÅÄÖ]{3}/.test(b.text) || /^\s*(NOT|NOTE)\s+\d+/i.test(b.text));
-      return bHeading - aHeading || b.rect[3] - a.rect[3];
+      const aNote = Number(/^\s*(NOT|NOTE)\s*\d+/i.test(a.text));
+      const bNote = Number(/^\s*(NOT|NOTE)\s*\d+/i.test(b.text));
+      const aHeading = Number(/[A-ZÅÄÖ]{3}/.test(a.text));
+      const bHeading = Number(/[A-ZÅÄÖ]{3}/.test(b.text));
+      return bNote - aNote || bHeading - aHeading || b.rect[3] - a.rect[3];
     });
   return candidates[0]?.text.trim().slice(0, 220) || "Financial table";
 }
@@ -337,7 +367,9 @@ export function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
           ? keyFiguresTitle
           : normalizedInlineTitle.length >= 3 && informativeInlineWords.length > 0
             ? inlineTitle.slice(0, 220)
-            : tableTitle(page.lines, rect[1]),
+            : tableTitle(page.lines, rect[1]) === "Financial table"
+              ? `Financial table ${tableIndex + 1}`
+              : tableTitle(page.lines, rect[1]),
       };
     });
 }
@@ -418,17 +450,24 @@ export function extractCells(pages: ExtractedPage[]) {
       const y = line.rect[1];
 
       for (const number of numbers) {
-        const header = headerBands
-          .map((candidate) => ({
+        const headerCandidates = headerBands.map((candidate) => ({
             candidate,
-            vertical: Math.abs(y - (candidate.rect[1] + candidate.rect[3]) / 2),
+            vertical: y - candidate.rect[3],
             horizontal: Math.min(...candidate.years.map((item) =>
               Math.abs(tokenCenter(item.token) - tokenCenter(number)),
             )),
-          }))
-          .filter((item) => item.vertical < 420)
+          }));
+        // Prefer a preceding header so the next note cannot steal the final
+        // rows from the note above. Some unusual tables print their years below
+        // the values, so retain absolute-distance fallback only when no
+        // preceding header exists.
+        const precedingHeaders = headerCandidates.filter((item) => item.vertical >= -4 && item.vertical < 420);
+        const header = (precedingHeaders.length
+          ? precedingHeaders
+          : headerCandidates.filter((item) => Math.abs(item.vertical) < 420))
           .sort((a, b) =>
-            a.horizontal + a.vertical * 0.35 - (b.horizontal + b.vertical * 0.35),
+            a.horizontal + Math.abs(a.vertical) * 0.35 -
+            (b.horizontal + Math.abs(b.vertical) * 0.35),
           )[0]?.candidate;
         if (!header) continue;
         const sortedYears = [...header.years].sort((a, b) => tokenCenter(a.token) - tokenCenter(b.token));
@@ -485,6 +524,12 @@ export function extractCells(pages: ExtractedPage[]) {
 function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
   const scored = candidates
     .map((candidate) => {
+      const exactEquivalent = cell.normalizedLabel === candidate.normalizedLabel || damagedLabelEquivalent(
+        cell.label,
+        candidate.label,
+        cell.normalizedLabel,
+        candidate.normalizedLabel,
+      );
       const label = labelSimilarity(
         cell.normalizedLabel,
         candidate.normalizedLabel,
@@ -507,6 +552,7 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
         labelScore: label,
         contextScore: section + title + proximity + table,
         titleScore: titleSimilarity,
+        exactEquivalent,
         equal: Math.abs(cell.value - candidate.value) < 0.000001,
       };
     })
@@ -529,10 +575,11 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
       item.titleScore >= 0.68 &&
       Math.abs(item.candidate.relativePage - cell.relativePage) < 0.2,
   );
-  const exactCandidates = scored.filter((item) => item.labelScore === 1);
+  const exactCandidates = scored.filter((item) => item.exactEquivalent);
   const secondExact = exactCandidates.find((item) => item.candidate.id !== best.candidate.id);
   const confidentMismatch =
-    best.labelScore === 1 &&
+    best.exactEquivalent &&
+    !isResidualLabel(cell.normalizedLabel) &&
     best.candidate.section === cell.section &&
     best.titleScore >= 0.72 &&
     Math.abs(best.candidate.relativePage - cell.relativePage) < 0.18 &&
@@ -615,8 +662,12 @@ function buildArithmeticProposals(
         candidate.year === cell.year &&
         !protectedOlderIds.has(candidate.id) &&
         candidate.value !== 0 &&
-        labelSimilarity(title, normalizeLabel(candidate.tableTitle)) >= 0.65 &&
-        Math.abs(candidate.relativePage - cell.relativePage) < 0.2,
+        Math.abs(candidate.relativePage - cell.relativePage) < 0.2 &&
+        (
+          candidate.tableIndex === cell.tableIndex &&
+          Math.abs(candidate.relativePage - cell.relativePage) < 0.12 ||
+          labelSimilarity(title, normalizeLabel(candidate.tableTitle)) >= 0.65
+        ),
       )
       .sort((a, b) =>
         Number(b.id === match?.candidate.id) - Number(a.id === match?.candidate.id) ||
@@ -659,8 +710,12 @@ function buildArithmeticProposals(
       .filter((cell) =>
         cell.year === older.year &&
         cell.value !== 0 &&
-        labelSimilarity(normalizeLabel(cell.tableTitle), normalizeLabel(older.tableTitle)) >= 0.65 &&
-        Math.abs(cell.relativePage - older.relativePage) < 0.2,
+        Math.abs(cell.relativePage - older.relativePage) < 0.2 &&
+        (
+          cell.tableIndex === older.tableIndex &&
+          Math.abs(cell.relativePage - older.relativePage) < 0.12 ||
+          labelSimilarity(normalizeLabel(cell.tableTitle), normalizeLabel(older.tableTitle)) >= 0.65
+        ),
       )
       .sort((a, b) =>
         labelSimilarity(b.normalizedLabel, older.normalizedLabel) -
@@ -803,12 +858,29 @@ export async function analyzePair(
           .slice(0, 6);
         for (const candidate of candidates) {
           olderCandidates.set(candidate.id, candidate);
-          directPairs.push({ newerId: cell.id, olderId: candidate.id });
+          // A bare residual row is contextual, never a stable identity. When
+          // its value changed, do not even ask Jev to bless the same generic
+          // word; let equal-value renamed candidates compete instead.
+          if (!(
+            isResidualLabel(cell.normalizedLabel) &&
+            candidate.normalizedLabel === cell.normalizedLabel &&
+            !arithmeticEqual(cell.value, candidate.value)
+          )) directPairs.push({ newerId: cell.id, olderId: candidate.id });
+        }
+      }
+      // Arithmetic discovery must see the whole bounded table context. Running
+      // it only over the six direct-retrieval candidates caused valid terms at
+      // the bottom of a note (for example Bankkostnader) to disappear before
+      // subset enumeration even began.
+      const proposedGroups = buildArithmeticProposals(batch, olderCells, protectedOlderIds);
+      for (const group of proposedGroups) {
+        for (const id of group.olderIds) {
+          const candidate = olderById.get(id);
+          if (candidate) olderCandidates.set(id, candidate);
         }
       }
       const olderCandidateCells = [...olderCandidates.values()].slice(0, 160);
       const olderRows = olderCandidateCells.map(toModelRow);
-      const proposedGroups = buildArithmeticProposals(batch, olderCandidateCells, protectedOlderIds);
       if (!newerRows.length || !olderRows.length) continue;
 
       const batchLabel = batches.length > 1 ? ` (batch ${batchIndex + 1}/${batches.length})` : "";
@@ -857,7 +929,10 @@ export async function analyzePair(
           );
           const preservesDeterministicMismatch = mapping.relationship !== "direct" || mappedNewerIds.every((id) => {
             const deterministicTarget = deterministicMismatchTargets.get(id);
-            return !deterministicTarget || deterministicTarget === mappedOlderIds[0];
+            // A unique exact (including deterministically repaired damaged-glyph)
+            // alignment already owns this control. Jev cannot strengthen it and
+            // must not replace its deterministic red/green provenance.
+            return !deterministicTarget;
           });
           if (
             !validRelationship ||
@@ -911,9 +986,8 @@ export async function analyzePair(
         const exactAlignedDirect = mapping.relationship === "direct" &&
           newerGroup.length === 1 &&
           olderGroup.length === 1 &&
-          newerGroup[0].normalizedLabel === olderGroup[0].normalizedLabel &&
+          Boolean(match?.exactEquivalent) &&
           match?.candidate.id === olderGroup[0].id &&
-          match.labelScore === 1 &&
           match.confidentMismatch &&
           !match.ambiguous;
         const operator = equal ? "=" : "≠";
@@ -945,6 +1019,7 @@ export async function analyzePair(
                 olderTerms: olderGroup.map((item) => ({ label: item.label, value: item.valueText })),
               }
             : undefined,
+          judgment: mapping.judgment || { basis: "jev" },
         });
         continue;
       }
@@ -952,7 +1027,7 @@ export async function analyzePair(
 
     const source = match?.candidate;
     const method: Discrepancy["matchMethod"] = match
-      ? match.labelScore === 1 ? "exact" : "similar"
+      ? match.exactEquivalent ? "exact" : "similar"
       : "none";
     const comparedValue = source?.value ?? null;
     const equal = comparedValue !== null && Math.abs(cell.value - comparedValue) < 0.000001;
@@ -977,6 +1052,7 @@ export async function analyzePair(
       explanation: describe(status, cell, source, source?.valueText, comparedValue !== null && status === "missing"),
       newer: evidence(cell),
       older: source ? evidence(source) : undefined,
+      judgment: { basis: "deterministic" },
     });
   }
 

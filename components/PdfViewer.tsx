@@ -37,6 +37,17 @@ function targetsFor(highlight: Discrepancy, side: "newer" | "older") {
   return primary ? [primary, ...(related || [])] : [];
 }
 
+function judgmentSummary(highlight: Discrepancy) {
+  if (highlight.judgment.basis === "deterministic") return "Deterministic control";
+  const approval = highlight.judgment.outcomeProbability;
+  const confidence = highlight.judgment.confidence;
+  if (approval === undefined && confidence === undefined) return "Jev-assisted control";
+  return [
+    approval === undefined ? null : `Jev approval ${Math.round(approval * 100)}%`,
+    confidence === undefined ? null : `confidence ${Math.round(confidence * 100)}%`,
+  ].filter(Boolean).join(" · ");
+}
+
 type ContinuousPageProps = {
   pdf: BrowserPdf;
   pageIndex: number;
@@ -165,6 +176,7 @@ function ContinuousPage({
             <div className="highlight-layer">
               {pageHighlights.map(({ highlight, target }) => {
                 const isActive = activeHighlight === highlight.id;
+                const judgmentText = judgmentSummary(highlight);
                 return (
                   <Fragment key={`${highlightSide}-${highlight.id}-${target.tokenId}`}>
                     {target.keyRect && (
@@ -190,12 +202,13 @@ function ContinuousPage({
                       onFocus={() => onHighlight?.(highlight.id)}
                       onBlur={() => onHighlight?.(null)}
                       onClick={() => onHighlightActivate?.(highlight, target)}
-                      aria-label={highlight.explanation}
+                      aria-label={`${highlight.explanation} ${judgmentText}`}
                     >
                       <span className="highlight-tooltip">
                         <strong>{highlight.labelNew}</strong>
                         <span>{highlight.explanation}</span>
                         {highlight.arithmetic && <code>{highlight.arithmetic.expression}</code>}
+                        <small className="control-confidence">{judgmentText}</small>
                         <small>
                           {highlight.matchMethod === "model"
                             ? highlight.arithmetic ? "Jev-validated grouping · deterministic math" : "Jev-assisted label match"

@@ -1353,6 +1353,14 @@ button:disabled {
   text-transform: capitalize;
 }
 
+.highlight-tooltip .control-confidence {
+  color: #fff;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 620;
+  text-transform: none;
+}
+
 .highlight-tooltip code {
   display: block;
   margin-top: 2px;
@@ -1655,6 +1663,7 @@ button:disabled {
 }
 
 .result-stat.match { color: var(--green); background: var(--green-soft); }
+.result-stat.arithmetic { color: var(--blue); background: rgba(0, 112, 243, 0.1); }
 .result-stat.mismatch { color: var(--red); background: var(--red-soft); }
 .result-stat.missing { color: #666; background: var(--gray-soft); }
 
