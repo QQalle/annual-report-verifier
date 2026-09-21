@@ -52,10 +52,16 @@ type ArithmeticProposal = {
   relationship: "aggregate";
 };
 
+type DirectCandidate = {
+  newerId: string;
+  olderId: string;
+};
+
 type ResolveLabels = (
   newerRows: ModelRow[],
   olderRows: ModelRow[],
   proposedGroups: ArithmeticProposal[],
+  directPairs: DirectCandidate[],
 ) => Promise<{ mappings: ModelMapping[] }>;
 
 const sectionRules: Array<[RegExp, string]> = [
@@ -81,6 +87,7 @@ const stopwords = new Set([
   "i",
   "till",
   "sek",
+  "sekm",
   "msek",
   "tsek",
   "kr",
@@ -182,6 +189,11 @@ function rectUnion(rects: Rect[]): Rect {
 }
 
 function tableTitle(lines: PdfLine[], headerTop: number) {
+  const boilerplateWords = new Set([
+    "as", "at", "per", "den", "jan", "january", "feb", "february", "mar", "march",
+    "apr", "april", "maj", "may", "jun", "june", "jul", "july", "aug", "august",
+    "sep", "september", "okt", "oct", "october", "nov", "november", "dec", "december",
+  ]);
   const candidates = lines
     .filter((line) => line.rect[3] <= headerTop + 3 && headerTop - line.rect[3] < 150)
     .filter((line) => {
@@ -190,7 +202,10 @@ function tableTitle(lines: PdfLine[], headerTop: number) {
       }
       const words = line.tokens.filter((token) => yearFromToken(token) === null && !token.isNumber);
       const text = words.map((token) => token.text).join(" ");
-      return /[a-zåäö]/i.test(text) && normalizeLabel(text).length >= 3;
+      const informativeWords = normalizeLabel(text)
+        .split(" ")
+        .filter((word) => word && !boilerplateWords.has(word) && !/^\d+$/.test(word));
+      return /[a-zåäö]/i.test(text) && informativeWords.length > 0;
     })
     .sort((a, b) => {
       const aHeading = Number(/[A-ZÅÄÖ]{3}/.test(a.text) || /^\s*(NOT|NOTE)\s+\d+/i.test(a.text));
@@ -200,26 +215,53 @@ function tableTitle(lines: PdfLine[], headerTop: number) {
   return candidates[0]?.text.trim().slice(0, 220) || "Financial table";
 }
 
-function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
+export function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
   const allowedHeaderWords = new Set([
     "as", "at", "per", "den", "jan", "january", "feb", "february", "mar", "march",
     "apr", "april", "maj", "may", "jun", "june", "jul", "july", "aug", "august",
     "sep", "september", "okt", "oct", "october", "nov", "november", "dec", "december",
-    "sek", "tsek", "ksek", "msek", "kr",
+    "sek", "sekm", "tsek", "ksek", "msek", "kr",
   ]);
+  const splitYearLine = (line: PdfLine) => {
+    const years = line.tokens
+      .map((token) => ({ token, year: yearFromToken(token) }))
+      .filter((item): item is { token: PdfToken; year: number } => item.year !== null)
+      .sort((a, b) => tokenCenter(a.token) - tokenCenter(b.token));
+    if (years.length < 2) return [{ line, years }];
+    const gaps = years.slice(1).map((item, index) => tokenCenter(item.token) - tokenCenter(years[index].token));
+    const ordinaryGaps = [...gaps].sort((a, b) => a - b).slice(0, Math.max(1, gaps.length - 1));
+    const medianGap = ordinaryGaps[Math.floor(ordinaryGaps.length / 2)] || 0;
+    const groups: typeof years[] = [[]];
+    years.forEach((item, index) => {
+      if (index > 0 && gaps[index - 1] > Math.max(120, medianGap * 1.8)) groups.push([]);
+      groups.at(-1)!.push(item);
+    });
+    if (groups.length === 1) return [{ line, years }];
+    return groups.map((group, groupIndex) => {
+      const leftEdge = groupIndex === 0
+        ? -Infinity
+        : (tokenCenter(groups[groupIndex - 1].at(-1)!.token) + tokenCenter(group[0].token)) / 2;
+      const rightEdge = groupIndex === groups.length - 1
+        ? Infinity
+        : (tokenCenter(group.at(-1)!.token) + tokenCenter(groups[groupIndex + 1][0].token)) / 2;
+      const tokens = line.tokens.filter((token) => {
+        const center = tokenCenter(token);
+        return center >= leftEdge && center < rightEdge;
+      });
+      return {
+        line: { ...line, rect: rectUnion(tokens.map((token) => token.rect)), tokens },
+        years: group,
+      };
+    });
+  };
   const yearLines = page.lines
-    .map((line) => ({
-      line,
-      years: line.tokens
-        .map((token) => ({ token, year: yearFromToken(token) }))
-        .filter((item): item is { token: PdfToken; year: number } => item.year !== null),
-    }))
+    .flatMap(splitYearLine)
     .filter(({ line, years }) => {
       if (!years.length) return false;
       const textTokens = line.tokens.filter((token) => yearFromToken(token) === null && !token.isNumber);
       const nonDateWords = textTokens
         .flatMap((token) => normalizeLabel(token.text).split(" "))
-        .filter((word) => word && !allowedHeaderWords.has(word));
+        .filter((word) => word && !allowedHeaderWords.has(word) && !/^\d+$/.test(word));
       if (nonDateWords.length === 0) return true;
       const headingText = textTokens.map((token) => token.text).join(" ").trim();
       const normalizedHeading = normalizeLabel(headingText);
@@ -235,9 +277,17 @@ function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
 
   for (const seed of yearLines) {
     const center = (seed.line.rect[1] + seed.line.rect[3]) / 2;
+    const seedMinX = Math.min(...seed.years.map((item) => tokenCenter(item.token)));
+    const seedMaxX = Math.max(...seed.years.map((item) => tokenCenter(item.token)));
     const nearby = yearLines.filter(({ line }) => {
       const otherCenter = (line.rect[1] + line.rect[3]) / 2;
-      return Math.abs(otherCenter - center) <= 30;
+      const lineYears = line.tokens
+        .map((token) => ({ token, year: yearFromToken(token) }))
+        .filter((item): item is { token: PdfToken; year: number } => item.year !== null);
+      const otherMinX = Math.min(...lineYears.map((item) => tokenCenter(item.token)));
+      const otherMaxX = Math.max(...lineYears.map((item) => tokenCenter(item.token)));
+      const horizontalGap = Math.max(0, seedMinX - otherMaxX, otherMinX - seedMaxX);
+      return Math.abs(otherCenter - center) <= 30 && horizontalGap <= 80;
     });
     const years = nearby.flatMap((item) => item.years);
     const distinct = [...new Set(years.map((item) => item.year))];
@@ -272,6 +322,9 @@ function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
         .join(" ")
         .trim();
       const normalizedInlineTitle = normalizeLabel(inlineTitle);
+      const informativeInlineWords = normalizedInlineTitle
+        .split(" ")
+        .filter((word) => word && !allowedHeaderWords.has(word) && !/^\d+$/.test(word));
       const isColumnHeading = /^(nyckeltal|key figures?|key metrics?)$/i.test(normalizedInlineTitle);
       const keyFiguresTitle = /^nyckeltal$/i.test(normalizedInlineTitle)
         ? "Flerårsöversikt"
@@ -282,7 +335,7 @@ function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
         tableIndex,
         title: isColumnHeading
           ? keyFiguresTitle
-          : normalizedInlineTitle.length >= 3
+          : normalizedInlineTitle.length >= 3 && informativeInlineWords.length > 0
             ? inlineTitle.slice(0, 220)
             : tableTitle(page.lines, rect[1]),
       };
@@ -290,9 +343,24 @@ function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
 }
 
 function leadingLabel(line: PdfLine, number: PdfToken, labelCutoff: number, previous?: PdfLine) {
+  const numberIndex = line.tokens.findIndex((token) => token.id === number.id);
+  let labelStart = 0;
+  for (let index = 1; index < numberIndex; index += 1) {
+    if (
+      line.tokens[index - 1].isNumber &&
+      !line.tokens[index].isNumber &&
+      /[a-zåäö]/i.test(line.tokens[index].text)
+    ) labelStart = index;
+  }
   let tokens = line.tokens
-    .filter((token) => token.rect[2] <= Math.min(number.rect[0] + 1, labelCutoff) && !token.isNumber);
+    .slice(labelStart, numberIndex)
+    .filter((token) =>
+      token.rect[2] <= Math.min(number.rect[0] + 1, labelCutoff) &&
+      !token.isNumber &&
+      /[a-zåäö]/i.test(token.text),
+    );
   const previousIsWrapped = previous &&
+    labelStart === 0 &&
     !previous.tokens.some((token) => token.isNumber) &&
     line.rect[1] - previous.rect[3] < 16 &&
     Math.abs(previous.rect[0] - line.rect[0]) < 18 &&
@@ -317,11 +385,16 @@ function leadingLabel(line: PdfLine, number: PdfToken, labelCutoff: number, prev
   return null;
 }
 
-function nearbyRowLabels(page: ExtractedPage, lineIndex: number, labelCutoff: number) {
+function nearbyRowLabels(page: ExtractedPage, lineIndex: number, labelCutoff: number, labelStart: number) {
   return page.lines
     .slice(Math.max(0, lineIndex - 2), lineIndex + 3)
     .map((line) => line.tokens
-      .filter((token) => !token.isNumber && token.rect[2] <= labelCutoff)
+      .filter((token) =>
+        !token.isNumber &&
+        token.rect[0] >= labelStart - 4 &&
+        token.rect[2] <= labelCutoff &&
+        /[a-zåäö]/i.test(token.text),
+      )
       .map((token) => token.text)
       .join(" ")
       .trim())
@@ -329,7 +402,7 @@ function nearbyRowLabels(page: ExtractedPage, lineIndex: number, labelCutoff: nu
     .slice(0, 5);
 }
 
-function extractCells(pages: ExtractedPage[]) {
+export function extractCells(pages: ExtractedPage[]) {
   const cells: ComparableCell[] = [];
   for (const page of pages) {
     const pageLevelSection = pageSection(page);
@@ -343,14 +416,21 @@ function extractCells(pages: ExtractedPage[]) {
       );
       if (numbers.length < 2) continue;
       const y = line.rect[1];
-      const header = headerBands
-        .filter((candidate) => Math.abs(y - (candidate.rect[1] + candidate.rect[3]) / 2) < 420)
-        .sort((a, b) =>
-          Math.abs(y - (a.rect[1] + a.rect[3]) / 2) - Math.abs(y - (b.rect[1] + b.rect[3]) / 2),
-        )[0];
-      if (!header) continue;
 
       for (const number of numbers) {
+        const header = headerBands
+          .map((candidate) => ({
+            candidate,
+            vertical: Math.abs(y - (candidate.rect[1] + candidate.rect[3]) / 2),
+            horizontal: Math.min(...candidate.years.map((item) =>
+              Math.abs(tokenCenter(item.token) - tokenCenter(number)),
+            )),
+          }))
+          .filter((item) => item.vertical < 420)
+          .sort((a, b) =>
+            a.horizontal + a.vertical * 0.35 - (b.horizontal + b.vertical * 0.35),
+          )[0]?.candidate;
+        if (!header) continue;
         const sortedYears = [...header.years].sort((a, b) => tokenCenter(a.token) - tokenCenter(b.token));
         const nearest = [...sortedYears].sort(
           (a, b) =>
@@ -394,7 +474,7 @@ function extractCells(pages: ExtractedPage[]) {
           labelRect: labelInfo!.rect,
           yearRect: nearest.token.rect,
           tableTitle: header.title,
-          nearbyRows: nearbyRowLabels(page, index, labelCutoff),
+          nearbyRows: nearbyRowLabels(page, index, labelCutoff, labelInfo!.rect[0]),
         });
       }
     }
@@ -570,7 +650,7 @@ function buildArithmeticProposals(
 
   // Search the inverse direction as well: several rows in the newer report may
   // have replaced one combined row in the older report. These groups are still
-  // bounded and proven numerically before the model sees their IDs.
+  // bounded and proven numerically before Jev sees their labels and context.
   for (const older of olderCandidates) {
     if (proposals.length >= 80) break;
     if (protectedOlderIds.has(older.id) || older.value === 0) continue;
@@ -689,7 +769,7 @@ export async function analyzePair(
   const mappings: ModelMapping[] = [];
 
   if (unresolved.length && options?.resolveLabels) {
-    const batchSize = 40;
+    const batchSize = 12;
     const batches = Array.from(
       { length: Math.ceil(unresolved.length / batchSize) },
       (_, index) => unresolved.slice(index * batchSize, (index + 1) * batchSize),
@@ -702,6 +782,7 @@ export async function analyzePair(
     for (const [batchIndex, batch] of batches.entries()) {
       const newerRows = batch.map((item) => toModelRow(item.cell));
       const olderCandidates = new Map<string, ComparableCell>();
+      const directPairs: DirectCandidate[] = [];
       for (const { cell } of batch) {
         const candidates = (olderByYear.get(cell.year) || [])
           .filter(
@@ -712,14 +793,18 @@ export async function analyzePair(
           )
           .sort(
             (a, b) =>
+              Number(arithmeticEqual(cell.value, b.value)) - Number(arithmeticEqual(cell.value, a.value)) ||
               Number(b.section === cell.section) - Number(a.section === cell.section) ||
               labelSimilarity(normalizeLabel(b.tableTitle), normalizeLabel(cell.tableTitle)) -
                 labelSimilarity(normalizeLabel(a.tableTitle), normalizeLabel(cell.tableTitle)) ||
               Math.abs(a.relativePage - cell.relativePage) -
                 Math.abs(b.relativePage - cell.relativePage),
           )
-          .slice(0, 40);
-        for (const candidate of candidates) olderCandidates.set(candidate.id, candidate);
+          .slice(0, 6);
+        for (const candidate of candidates) {
+          olderCandidates.set(candidate.id, candidate);
+          directPairs.push({ newerId: cell.id, olderId: candidate.id });
+        }
       }
       const olderCandidateCells = [...olderCandidates.values()].slice(0, 160);
       const olderRows = olderCandidateCells.map(toModelRow);
@@ -730,17 +815,17 @@ export async function analyzePair(
       options.onProgress?.(
         0.9 + ((batchIndex + 1) / batches.length) * 0.07,
         (proposedGroups.length
-          ? "Validating arithmetic row groups with the selected model"
-          : "Resolving renamed rows with the selected model") + batchLabel,
+          ? "Validating arithmetic row groups with Jev"
+          : "Resolving renamed rows with Jev") + batchLabel,
       );
       try {
-        const response = await options.resolveLabels(newerRows, olderRows, proposedGroups);
+        const response = await options.resolveLabels(newerRows, olderRows, proposedGroups, directPairs);
         const validNewerIds = new Set(newerRows.map((row) => row.id));
         const validOlderIds = new Set(olderRows.map((row) => row.id));
         const proposedSignatures = new Set(
           proposedGroups.map((group) => mappingSignature(group.newerIds, group.olderIds)),
         );
-        // A model can occasionally return both the supplied aggregate and a
+        // Jev can approve both the supplied aggregate and a competing direct
         // competing one-to-one mapping for its anchor row. Apply the aggregate
         // first so the exact, deterministically verified regrouping is not
         // discarded merely because of response ordering.
@@ -843,12 +928,12 @@ export async function analyzePair(
           valueOld: olderExpression,
           matchMethod: "model",
           explanation: isArithmetic
-            ? `${newerGroup[0].year}: ${newerExpression} ${operator} ${olderExpression}. The model identified a semantically coherent split/merge; the totals were checked deterministically.`
+            ? `${newerGroup[0].year}: ${newerExpression} ${operator} ${olderExpression}. Jev identified a semantically coherent split/merge; the totals were checked deterministically.`
             : equal
               ? describe("match", newerGroup[0], olderGroup[0], olderExpression)
               : exactAlignedDirect
                 ? describe("mismatch", newerGroup[0], olderGroup[0], olderExpression)
-                : `${newerGroup[0].year}: the model found a possible renamed counterpart, but unequal values require a unique exact-label deterministic alignment before a discrepancy can be flagged.`,
+                : `${newerGroup[0].year}: Jev found a possible renamed counterpart, but unequal values require a unique exact-label deterministic alignment before a discrepancy can be flagged.`,
           newer: evidence(newerGroup[0]),
           older: evidence(olderGroup[0]),
           newerRelated: newerGroup.slice(1).map(evidence),

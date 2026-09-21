@@ -198,7 +198,7 @@ function ContinuousPage({
                         {highlight.arithmetic && <code>{highlight.arithmetic.expression}</code>}
                         <small>
                           {highlight.matchMethod === "model"
-                            ? highlight.arithmetic ? "Model-validated grouping · deterministic math" : "Model-assisted label match"
+                            ? highlight.arithmetic ? "Jev-validated grouping · deterministic math" : "Jev-assisted label match"
                             : `${highlight.matchMethod} label match`}
                         </small>
                       </span>

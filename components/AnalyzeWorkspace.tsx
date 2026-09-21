@@ -115,7 +115,7 @@ export function AnalyzeWorkspace() {
     newer: null,
     older: null,
   });
-  const { isConfigured, callModel, provider } = useModel();
+  const { isConfigured, callModel } = useModel();
   const newerRef = useRef<BrowserPdf | null>(null);
   const olderRef = useRef<BrowserPdf | null>(null);
   const interactionId = useRef(0);
@@ -211,8 +211,8 @@ export function AnalyzeWorkspace() {
           setProgressLabel(label);
         },
         resolveLabels: isConfigured
-          ? (newerRows, olderRows, proposedGroups) =>
-              callModel("match-labels", { newerRows, olderRows, proposedGroups }) as Promise<{
+          ? (newerRows, olderRows, proposedGroups, directPairs) =>
+              callModel("match-labels", { newerRows, olderRows, proposedGroups, directPairs }) as Promise<{
                 mappings: Array<{
                   newerIds: string[];
                   olderIds: string[];
@@ -344,7 +344,7 @@ export function AnalyzeWorkspace() {
             </button>
           </div>
           <span className="analysis-method">
-            {analysis.comparedCells} cells · {analysis.modelAssisted} model-assisted
+            {analysis.comparedCells} cells · {analysis.modelAssisted} Jev-assisted
           </span>
         </div>
       )}
@@ -430,7 +430,7 @@ export function AnalyzeWorkspace() {
 
       {!isConfigured && newerPdf && olderPdf && !analysis && (
         <p className="claude-hint">
-          Deterministic analysis is ready. Add an {provider === "openai" ? "OpenAI" : "Anthropic"} key to resolve renamed note rows.
+          Deterministic analysis is ready. Add a TypeSafe key to let Jev review renamed note rows.
         </p>
       )}
     </div>

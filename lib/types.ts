@@ -116,7 +116,7 @@ export type AnalysisResult = {
   modelAssisted: number;
 };
 
-export type ModelProvider = "openai" | "anthropic";
+export type ModelProvider = "typesafe";
 
 export type ModelUsage = {
   input_tokens?: number;
@@ -129,7 +129,7 @@ export type ModelCall = {
   id: string;
   provider: ModelProvider;
   model: string;
-  purpose: "connection" | "synonym" | "match-labels";
+  purpose: "connection" | "match-labels";
   createdAt: string;
   status: "pending" | "success" | "error";
   request: unknown;

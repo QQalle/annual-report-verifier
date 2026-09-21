@@ -1,4 +1,7 @@
-# Token spend
+# Historical token spend (pre-Jev)
+
+> These figures describe the previous OpenAI implementation. Fourth Pass uses
+> TypeSafe Jev and records current usage in the in-app audit sidebar.
 
 This page records the model usage from the two final live analysis cases. The
 figures come from the in-app **Session usage** and **API calls** audit views in
