@@ -80,6 +80,7 @@ export type ArithmeticCheck = {
 
 export type ControlJudgment = {
   basis: "deterministic" | "jev";
+  decision?: "unlinked" | "review" | "aligned" | "coherent";
   score?: number;
   confidence?: number;
   outcomeProbability?: number;

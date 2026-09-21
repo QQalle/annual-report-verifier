@@ -57,6 +57,26 @@ type ArithmeticProposal = {
 type DirectCandidate = {
   newerId: string;
   olderId: string;
+  evidence: {
+    deterministicEqual: boolean;
+    sameReportedYear: boolean;
+    samePdfPage: boolean;
+    pageDelta: number;
+    sameTableOrdinal: boolean;
+    sameSection: boolean;
+    tableTitleSimilarity: number;
+    rowDistancePoints: number | null;
+    sameRowPosition: boolean;
+    damagedGlyph: boolean;
+    sharedNearbyRows: string[];
+  };
+};
+
+type ModelReview = {
+  newerId: string;
+  olderId: string;
+  decision: "unlinked" | "review" | "aligned";
+  judgment: ControlJudgment;
 };
 
 type ResolveLabels = (
@@ -64,7 +84,7 @@ type ResolveLabels = (
   olderRows: ModelRow[],
   proposedGroups: ArithmeticProposal[],
   directPairs: DirectCandidate[],
-) => Promise<{ mappings: ModelMapping[] }>;
+) => Promise<{ mappings: ModelMapping[]; reviews?: ModelReview[] }>;
 
 const sectionRules: Array<[RegExp, string]> = [
   [/flerårsöversikt|multi[- ]year overview|five[- ]year overview/i, "Multi-year overview"],
@@ -233,7 +253,13 @@ function tableTitle(lines: PdfLine[], headerTop: number) {
       const informativeWords = normalizeLabel(text)
         .split(" ")
         .filter((word) => word && !boilerplateWords.has(word) && !/^\d+$/.test(word));
-      return /[a-zåäö]/i.test(text) && informativeWords.length > 0;
+      const hasInterveningDataRow = lines.some(
+        (other) =>
+          other.rect[1] > line.rect[3] + 1 &&
+          other.rect[3] < headerTop - 1 &&
+          other.tokens.filter((token) => token.isNumber && yearFromToken(token) === null).length >= 2,
+      );
+      return /[a-zåäö]/i.test(text) && informativeWords.length > 0 && !hasInterveningDataRow;
     })
     .sort((a, b) => {
       const aNote = Number(/^\s*(NOT|NOTE)\s*\d+/i.test(a.text));
@@ -243,6 +269,47 @@ function tableTitle(lines: PdfLine[], headerTop: number) {
       return bNote - aNote || bHeading - aHeading || b.rect[3] - a.rect[3];
     });
   return candidates[0]?.text.trim().slice(0, 220) || "Financial table";
+}
+
+function sharedNearbyRows(newer: ComparableCell, older: ComparableCell) {
+  const usedOlder = new Set<number>();
+  const shared: string[] = [];
+  for (const label of newer.nearbyRows) {
+    const normalized = normalizeLabel(label);
+    if (!normalized) continue;
+    const matchIndex = older.nearbyRows.findIndex(
+      (candidate, index) =>
+        !usedOlder.has(index) &&
+        labelSimilarity(normalized, normalizeLabel(candidate), true) >= 0.72,
+    );
+    if (matchIndex >= 0) {
+      usedOlder.add(matchIndex);
+      shared.push(label);
+    }
+  }
+  return shared.slice(0, 5);
+}
+
+function directEvidence(newer: ComparableCell, older: ComparableCell): DirectCandidate["evidence"] {
+  const samePdfPage = newer.page === older.page;
+  const rowDistancePoints = samePdfPage
+    ? Math.round(Math.abs(newer.token.rect[1] - older.token.rect[1]) * 10) / 10
+    : null;
+  return {
+    deterministicEqual: arithmeticEqual(newer.value, older.value),
+    sameReportedYear: newer.year === older.year,
+    samePdfPage,
+    pageDelta: Math.abs(newer.page - older.page),
+    sameTableOrdinal: samePdfPage && newer.tableIndex === older.tableIndex,
+    sameSection: newer.section === older.section,
+    tableTitleSimilarity: Math.round(
+      labelSimilarity(normalizeLabel(newer.tableTitle), normalizeLabel(older.tableTitle), true) * 100,
+    ) / 100,
+    rowDistancePoints,
+    sameRowPosition: rowDistancePoints !== null && rowDistancePoints <= 42,
+    damagedGlyph: /�/.test(`${newer.label} ${older.label} ${newer.tableTitle} ${older.tableTitle}`),
+    sharedNearbyRows: sharedNearbyRows(newer, older),
+  };
 }
 
 export function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
@@ -822,6 +889,7 @@ export async function analyzePair(
       .map((item) => [item.cell.id, item.match!.candidate.id]),
   );
   const mappings: ModelMapping[] = [];
+  const modelReviews = new Map<string, ModelReview>();
 
   if (unresolved.length && options?.resolveLabels) {
     const batchSize = 12;
@@ -856,16 +924,56 @@ export async function analyzePair(
                 Math.abs(b.relativePage - cell.relativePage),
           )
           .slice(0, 6);
-        for (const candidate of candidates) {
+        const preparedCandidates = candidates.map((candidate) => {
           olderCandidates.set(candidate.id, candidate);
-          // A bare residual row is contextual, never a stable identity. When
-          // its value changed, do not even ask Jev to bless the same generic
-          // word; let equal-value renamed candidates compete instead.
-          if (!(
+          const pairEvidence = directEvidence(cell, candidate);
+          const semanticRetrieval = labelSimilarity(
+            cell.normalizedLabel,
+            candidate.normalizedLabel,
+            true,
+          );
+          const residualUnequal =
             isResidualLabel(cell.normalizedLabel) &&
             candidate.normalizedLabel === cell.normalizedLabel &&
-            !arithmeticEqual(cell.value, candidate.value)
-          )) directPairs.push({ newerId: cell.id, olderId: candidate.id });
+            !pairEvidence.deterministicEqual;
+          // Tiny bookkeeping values occur often enough that row position or
+          // table context alone is not useful retrieval evidence. Require a
+          // meaningful label resemblance before asking Jev about them,
+          // whether the candidate happens to be equal or unequal.
+          const unsafeTrivialCoincidence =
+            Math.abs(cell.value) <= 1 &&
+            semanticRetrieval < 0.55;
+          const plausibleContext =
+            semanticRetrieval >= 0.32 ||
+            (
+              pairEvidence.sameRowPosition &&
+              pairEvidence.sameTableOrdinal &&
+              pairEvidence.sameSection &&
+              pairEvidence.tableTitleSimilarity >= 0.8
+            ) ||
+            pairEvidence.sharedNearbyRows.length >= 3;
+          return { candidate, pairEvidence, plausibleContext, residualUnequal, unsafeTrivialCoincidence };
+        });
+        const equalCandidates = preparedCandidates.filter(
+          (item) =>
+            item.pairEvidence.deterministicEqual &&
+            item.plausibleContext &&
+            !item.unsafeTrivialCoincidence,
+        );
+        // Equal-value candidates are the only direct mappings that can become
+        // green. If none exists, retain one best possible counterpart so a Jev
+        // rejection remains visible instead of being mislabeled deterministic.
+        const selectedCandidates = equalCandidates.length
+          ? equalCandidates
+          : preparedCandidates.filter(
+              (item) => item.plausibleContext && !item.residualUnequal && !item.unsafeTrivialCoincidence,
+            ).slice(0, 1);
+        for (const { candidate, pairEvidence } of selectedCandidates) {
+          directPairs.push({
+            newerId: cell.id,
+            olderId: candidate.id,
+            evidence: pairEvidence,
+          });
         }
       }
       // Arithmetic discovery must see the whole bounded table context. Running
@@ -881,7 +989,7 @@ export async function analyzePair(
       }
       const olderCandidateCells = [...olderCandidates.values()].slice(0, 160);
       const olderRows = olderCandidateCells.map(toModelRow);
-      if (!newerRows.length || !olderRows.length) continue;
+      if (!newerRows.length || !olderRows.length || (!directPairs.length && !proposedGroups.length)) continue;
 
       const batchLabel = batches.length > 1 ? ` (batch ${batchIndex + 1}/${batches.length})` : "";
       options.onProgress?.(
@@ -897,6 +1005,24 @@ export async function analyzePair(
         const proposedSignatures = new Set(
           proposedGroups.map((group) => mappingSignature(group.newerIds, group.olderIds)),
         );
+        for (const review of response.reviews || []) {
+          if (
+            !validNewerIds.has(String(review.newerId)) ||
+            !validOlderIds.has(String(review.olderId)) ||
+            !["unlinked", "review", "aligned"].includes(review.decision) ||
+            review.judgment?.basis !== "jev"
+          ) continue;
+          const probability = Number(review.judgment.outcomeProbability);
+          if (!Number.isFinite(probability) || probability < 0 || probability > 1) continue;
+          const current = modelReviews.get(String(review.newerId));
+          if (!current || probability > Number(current.judgment.outcomeProbability || 0)) {
+            modelReviews.set(String(review.newerId), {
+              ...review,
+              newerId: String(review.newerId),
+              olderId: String(review.olderId),
+            });
+          }
+        }
         // Jev can approve both the supplied aggregate and a competing direct
         // competing one-to-one mapping for its anchor row. Apply the aggregate
         // first so the exact, deterministically verified regrouping is not
@@ -1026,6 +1152,7 @@ export async function analyzePair(
     }
 
     const source = match?.candidate;
+    const review = modelReviews.get(cell.id);
     const method: Discrepancy["matchMethod"] = match
       ? match.exactEquivalent ? "exact" : "similar"
       : "none";
@@ -1049,10 +1176,12 @@ export async function analyzePair(
       valueNew: cell.valueText,
       valueOld: source?.valueText,
       matchMethod: method,
-      explanation: describe(status, cell, source, source?.valueText, comparedValue !== null && status === "missing"),
+      explanation: review && status === "missing"
+        ? `${cell.year}: Jev reviewed possible counterparts but did not approve a reliable alignment. The control remains unresolved.`
+        : describe(status, cell, source, source?.valueText, comparedValue !== null && status === "missing"),
       newer: evidence(cell),
       older: source ? evidence(source) : undefined,
-      judgment: { basis: "deterministic" },
+      judgment: review?.judgment || { basis: "deterministic" },
     });
   }
 

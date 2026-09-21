@@ -41,9 +41,15 @@ function judgmentSummary(highlight: Discrepancy) {
   if (highlight.judgment.basis === "deterministic") return "Deterministic control";
   const approval = highlight.judgment.outcomeProbability;
   const confidence = highlight.judgment.confidence;
-  if (approval === undefined && confidence === undefined) return "Jev-assisted control";
+  const approved = highlight.judgment.decision === "aligned" ||
+    highlight.judgment.decision === "coherent" ||
+    highlight.matchMethod === "model";
+  if (approval === undefined && confidence === undefined) {
+    return approved ? "Jev-assisted control" : "Jev reviewed · alignment not approved";
+  }
   return [
-    approval === undefined ? null : `Jev approval ${Math.round(approval * 100)}%`,
+    approved ? "Jev approved" : "Jev reviewed",
+    approval === undefined ? null : `approval ${Math.round(approval * 100)}%`,
     confidence === undefined ? null : `confidence ${Math.round(confidence * 100)}%`,
   ].filter(Boolean).join(" · ");
 }
@@ -212,7 +218,9 @@ function ContinuousPage({
                         <small>
                           {highlight.matchMethod === "model"
                             ? highlight.arithmetic ? "Jev-validated grouping · deterministic math" : "Jev-assisted label match"
-                            : `${highlight.matchMethod} label match`}
+                            : highlight.judgment.basis === "jev"
+                              ? "Jev reviewed · alignment not approved"
+                              : `${highlight.matchMethod} label match`}
                         </small>
                       </span>
                     </button>

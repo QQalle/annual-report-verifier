@@ -220,6 +220,12 @@ export function AnalyzeWorkspace() {
                   relationship: "direct" | "aggregate" | "none";
                   judgment?: ControlJudgment;
                 }>;
+                reviews?: Array<{
+                  newerId: string;
+                  olderId: string;
+                  decision: "unlinked" | "review" | "aligned";
+                  judgment: ControlJudgment;
+                }>;
               }>
           : undefined,
       });
