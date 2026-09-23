@@ -37,6 +37,23 @@ function targetsFor(highlight: Discrepancy, side: "newer" | "older") {
   return primary ? [primary, ...(related || [])] : [];
 }
 
+function judgmentSummary(highlight: Discrepancy) {
+  if (highlight.judgment.basis === "deterministic") return "Deterministic control";
+  const approval = highlight.judgment.outcomeProbability;
+  const confidence = highlight.judgment.confidence;
+  const approved = highlight.judgment.decision === "aligned" ||
+    highlight.judgment.decision === "coherent" ||
+    highlight.matchMethod === "model";
+  if (approval === undefined && confidence === undefined) {
+    return approved ? "Jev-assisted control" : "Jev reviewed · alignment not approved";
+  }
+  return [
+    approved ? "Jev approved" : "Jev reviewed",
+    approval === undefined ? null : `approval ${Math.round(approval * 100)}%`,
+    confidence === undefined ? null : `confidence ${Math.round(confidence * 100)}%`,
+  ].filter(Boolean).join(" · ");
+}
+
 type ContinuousPageProps = {
   pdf: BrowserPdf;
   pageIndex: number;
@@ -165,6 +182,7 @@ function ContinuousPage({
             <div className="highlight-layer">
               {pageHighlights.map(({ highlight, target }) => {
                 const isActive = activeHighlight === highlight.id;
+                const judgmentText = judgmentSummary(highlight);
                 return (
                   <Fragment key={`${highlightSide}-${highlight.id}-${target.tokenId}`}>
                     {target.keyRect && (
@@ -190,16 +208,19 @@ function ContinuousPage({
                       onFocus={() => onHighlight?.(highlight.id)}
                       onBlur={() => onHighlight?.(null)}
                       onClick={() => onHighlightActivate?.(highlight, target)}
-                      aria-label={highlight.explanation}
+                      aria-label={`${highlight.explanation} ${judgmentText}`}
                     >
                       <span className="highlight-tooltip">
                         <strong>{highlight.labelNew}</strong>
                         <span>{highlight.explanation}</span>
                         {highlight.arithmetic && <code>{highlight.arithmetic.expression}</code>}
+                        <small className="control-confidence">{judgmentText}</small>
                         <small>
                           {highlight.matchMethod === "model"
-                            ? highlight.arithmetic ? "Model-validated grouping · deterministic math" : "Model-assisted label match"
-                            : `${highlight.matchMethod} label match`}
+                            ? highlight.arithmetic ? "Jev-validated grouping · deterministic math" : "Jev-assisted label match"
+                            : highlight.judgment.basis === "jev"
+                              ? "Jev reviewed · alignment not approved"
+                              : `${highlight.matchMethod} label match`}
                         </small>
                       </span>
                     </button>

@@ -12,9 +12,9 @@ import {
   X,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import { useModel } from "@/lib/model-context";
-import type { ModelCall, ModelProvider } from "@/lib/types";
 import { MODEL_OPTIONS } from "@/lib/model-config";
+import { useModel } from "@/lib/model-context";
+import type { ModelCall } from "@/lib/types";
 
 function number(value?: number) {
   return new Intl.NumberFormat("en-US").format(value || 0);
@@ -37,8 +37,7 @@ function CallRow({ call }: { call: ModelCall }) {
         <span className="call-copy">
           <strong>{call.purpose === "match-labels" ? "Semantic row match" : call.purpose}</strong>
           <small>
-            {call.provider === "openai" ? "OpenAI" : "Anthropic"} ·{" "}
-            {call.model} ·{" "}
+            TypeSafe · {call.model} ·{" "}
             {new Date(call.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
             {call.latencyMs ? ` · ${call.latencyMs} ms` : ""}
           </small>
@@ -74,8 +73,6 @@ function CallRow({ call }: { call: ModelCall }) {
 
 export function ModelSidebar({ onClose }: { onClose: () => void }) {
   const {
-    provider,
-    setProvider,
     model,
     setModel,
     apiKey,
@@ -121,30 +118,15 @@ export function ModelSidebar({ onClose }: { onClose: () => void }) {
       </div>
 
       <section className="sidebar-section key-section">
-        <div className="provider-switch" aria-label="Model provider">
-          {(["openai", "anthropic"] as ModelProvider[]).map((option) => (
-            <button
-              type="button"
-              key={option}
-              className={provider === option ? "active" : ""}
-              onClick={() => {
-                setProvider(option);
-                setTestState("idle");
-              }}
-            >
-              {option === "openai" ? "OpenAI" : "Anthropic"}
-            </button>
-          ))}
-        </div>
         <div className="section-title-row">
           <h3>Setup</h3>
           <span className={`status-pill ${isConfigured ? "ready" : ""}`}>
             {isConfigured ? <Check size={11} /> : null}
-            {envConfigured[provider] && !apiKey ? "Environment key" : isConfigured ? "Ready" : "Not configured"}
+            {envConfigured && !apiKey ? "Environment key" : isConfigured ? "Ready" : "Not configured"}
           </span>
         </div>
         <label className="field-label" htmlFor="model-key">
-          {provider === "openai" ? "OpenAI" : "Anthropic"} API key
+          TypeSafe API key
         </label>
         <div className="key-field">
           <KeyRound size={14} />
@@ -157,11 +139,7 @@ export function ModelSidebar({ onClose }: { onClose: () => void }) {
               setTestState("idle");
             }}
             placeholder={
-              envConfigured[provider]
-                ? `Using ${provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY"}`
-                : provider === "openai"
-                  ? "sk-proj-…"
-                  : "sk-ant-…"
+              envConfigured ? "Using TYPESAFE_API_KEY" : "TypeSafe API key"
             }
             autoComplete="new-password"
             data-1p-ignore="true"
@@ -178,7 +156,7 @@ export function ModelSidebar({ onClose }: { onClose: () => void }) {
           value={model}
           onChange={(event) => setModel(event.target.value as typeof model)}
         >
-          {MODEL_OPTIONS[provider].map((option) => (
+          {MODEL_OPTIONS.map((option) => (
             <option value={option.id} key={option.id}>
               {option.label}
             </option>
@@ -189,7 +167,7 @@ export function ModelSidebar({ onClose }: { onClose: () => void }) {
           className="button secondary full-width"
           type="button"
           onClick={testConnection}
-          disabled={testing || (!apiKey.trim() && !envConfigured[provider])}
+          disabled={testing || (!apiKey.trim() && !envConfigured)}
         >
           {testing ? <LoaderCircle size={14} className="spin" /> : <Clock3 size={14} />}
           {testing ? "Testing…" : "Test connection"}
@@ -238,7 +216,7 @@ export function ModelSidebar({ onClose }: { onClose: () => void }) {
             <div className="empty-calls">
               <span className="empty-call-icon">{`{ }`}</span>
               <p>No calls yet</p>
-              <small>Synonyms and semantic matches will appear here.</small>
+              <small>Jev semantic judgments will appear here.</small>
             </div>
           )}
         </div>

@@ -5,12 +5,12 @@ import { usePathname } from "next/navigation";
 import { Files, PanelRightClose, PanelRightOpen, ScanSearch } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { ModelProviderRoot, useModel } from "@/lib/model-context";
-import { ModelSidebar } from "./ClaudeSidebar";
+import { ModelSidebar } from "./ModelSidebar";
 
 function Shell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const { isConfigured, provider } = useModel();
+  const { isConfigured } = useModel();
 
   return (
     <div className={`app-shell ${sidebarOpen ? "sidebar-is-open" : ""}`}>
@@ -25,7 +25,7 @@ function Shell({ children }: { children: ReactNode }) {
             Analyze
           </Link>
         </nav>
-        <h1 className="product-title">Third Pass</h1>
+        <h1 className="product-title">Fourth Pass</h1>
         <div className="topbar-spacer" />
         <button
           className="sidebar-toggle"
@@ -35,7 +35,7 @@ function Shell({ children }: { children: ReactNode }) {
           aria-controls="model-sidebar"
         >
           <span className={`connection-dot ${isConfigured ? "connected" : ""}`} />
-          {provider === "openai" ? "OpenAI" : "Anthropic"}
+          TypeSafe
           {sidebarOpen ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
         </button>
       </header>

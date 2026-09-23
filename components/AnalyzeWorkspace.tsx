@@ -23,7 +23,7 @@ import { reportPairs } from "@/lib/catalog";
 import { useModel } from "@/lib/model-context";
 import { analyzePair } from "@/lib/compare";
 import { BrowserPdf, detectReportYear, fetchCataloguePdf } from "@/lib/pdf-engine";
-import type { AnalysisResult, Discrepancy, EvidenceTarget } from "@/lib/types";
+import type { AnalysisResult, ControlJudgment, Discrepancy, EvidenceTarget } from "@/lib/types";
 import { PdfViewer } from "./PdfViewer";
 
 type Side = "newer" | "older";
@@ -204,7 +204,7 @@ export function AnalyzeWorkspace() {
     newer: null,
     older: null,
   });
-  const { isConfigured, callModel, provider } = useModel();
+  const { isConfigured, callModel } = useModel();
   const newerRef = useRef<BrowserPdf | null>(null);
   const olderRef = useRef<BrowserPdf | null>(null);
   const interactionId = useRef(0);
@@ -354,13 +354,19 @@ export function AnalyzeWorkspace() {
           setProgressLabel(label);
         },
         resolveLabels: isConfigured
-          ? (newerRows, olderRows, proposedGroups, batch) =>
-              callModel("match-labels", { newerRows, olderRows, proposedGroups, batch }) as Promise<{
+          ? (newerRows, olderRows, proposedGroups, directPairs, batch) =>
+              callModel("match-labels", { newerRows, olderRows, proposedGroups, directPairs, batch }) as Promise<{
                 mappings: Array<{
                   newerIds: string[];
                   olderIds: string[];
                   relationship: "direct" | "aggregate" | "none";
-                  reason?: string;
+                  judgment?: ControlJudgment;
+                }>;
+                reviews?: Array<{
+                  newerId: string;
+                  olderId: string;
+                  decision: "unlinked" | "review" | "aligned";
+                  judgment: ControlJudgment;
                 }>;
               }>
           : undefined,
@@ -387,11 +393,15 @@ export function AnalyzeWorkspace() {
 
   const counts = analysis
     ? analysis.discrepancies.reduce(
-        (sum, item) => ({ ...sum, [item.status]: sum[item.status] + 1 }),
-        { match: 0, mismatch: 0, missing: 0 },
+        (sum, item) => ({
+          ...sum,
+          [item.status]: sum[item.status] + 1,
+          arithmetic: sum.arithmetic + Number(item.status === "match" && Boolean(item.arithmetic)),
+        }),
+        { match: 0, mismatch: 0, missing: 0, arithmetic: 0 },
       )
-    : { match: 0, mismatch: 0, missing: 0 };
-  const arithmeticCount = analysis?.discrepancies.filter((item) => Boolean(item.arithmetic)).length || 0;
+    : { match: 0, mismatch: 0, missing: 0, arithmetic: 0 };
+  const arithmeticCount = counts.arithmetic;
 
   const issueList = useMemo(
     () =>
@@ -520,7 +530,7 @@ export function AnalyzeWorkspace() {
             </button>
           </div>
           <span className="analysis-method">
-            {reviewedIssueIds.size}/{analysis.comparedCells} reviewed · {analysis.coverage.overlappingYearCells} comparative cells · {analysis.modelAssisted} model-assisted
+            {reviewedIssueIds.size}/{analysis.comparedCells} reviewed · {analysis.coverage.overlappingYearCells} comparative cells · {analysis.modelAssisted} Jev-assisted
           </span>
         </div>
       )}
@@ -643,7 +653,7 @@ export function AnalyzeWorkspace() {
 
       {!isConfigured && newerPdf && olderPdf && !analysis && (
         <p className="claude-hint">
-          Deterministic analysis is ready. Add an {provider === "openai" ? "OpenAI" : "Anthropic"} key to resolve renamed note rows.
+          Deterministic analysis is ready. Add a TypeSafe key to let Jev review renamed note rows.
         </p>
       )}
     </div>

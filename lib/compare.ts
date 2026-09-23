@@ -2,6 +2,7 @@ import type { BrowserPdf } from "./pdf-engine";
 import { parseSwedishNumber } from "./pdf-engine";
 import type {
   AnalysisResult,
+  ControlJudgment,
   Discrepancy,
   EvidenceTarget,
   ExtractedPage,
@@ -46,6 +47,7 @@ type ModelMapping = {
   olderIds: string[];
   relationship: "direct" | "aggregate" | "none";
   reason?: string;
+  judgment?: ControlJudgment;
 };
 
 type DeterministicProposal = {
@@ -54,12 +56,38 @@ type DeterministicProposal = {
   relationship: "direct" | "aggregate";
 };
 
+type DirectCandidate = {
+  newerId: string;
+  olderId: string;
+  evidence: {
+    deterministicEqual: boolean;
+    sameReportedYear: boolean;
+    samePdfPage: boolean;
+    pageDelta: number;
+    sameTableOrdinal: boolean;
+    sameSection: boolean;
+    tableTitleSimilarity: number;
+    rowDistancePoints: number | null;
+    sameRowPosition: boolean;
+    damagedGlyph: boolean;
+    sharedNearbyRows: string[];
+  };
+};
+
+type ModelReview = {
+  newerId: string;
+  olderId: string;
+  decision: "unlinked" | "review" | "aligned";
+  judgment: ControlJudgment;
+};
+
 type ResolveLabels = (
   newerRows: ModelRow[],
   olderRows: ModelRow[],
   proposedGroups: DeterministicProposal[],
+  directPairs: DirectCandidate[],
   batch: { index: number; count: number },
-) => Promise<{ mappings: ModelMapping[] }>;
+) => Promise<{ mappings: ModelMapping[]; reviews?: ModelReview[] }>;
 
 const sectionRules: Array<[RegExp, string]> = [
   [/flerårsöversikt|multi[- ]year overview|five[- ]year overview/i, "Multi-year overview"],
@@ -173,7 +201,7 @@ function damagedLabelEquivalent(a: string, b: string) {
 function isStableTableTitle(title: string) {
   const normalized = normalizeLabel(title);
   return Boolean(normalized) &&
-    normalized !== "financial table" &&
+    !/^financial table(?: \d+)?$/.test(normalized) &&
     !/^summa(?:\s|$)/.test(normalized);
 }
 
@@ -239,7 +267,13 @@ function tableTitle(lines: PdfLine[], headerTop: number) {
       if (!looksLikeNoteHeading && line.tokens.some((token) => token.isNumber)) return false;
       const words = line.tokens.filter((token) => yearFromToken(token) === null && !token.isNumber);
       const text = words.map((token) => token.text).join(" ");
-      return /[a-zåäö]/i.test(text) && normalizeLabel(text).length >= 3;
+      const hasInterveningDataRow = lines.some(
+        (other) =>
+          other.rect[1] > line.rect[3] + 1 &&
+          other.rect[3] < headerTop - 1 &&
+          other.tokens.filter((token) => token.isNumber && yearFromToken(token) === null).length >= 2,
+      );
+      return /[a-zåäö]/i.test(text) && normalizeLabel(text).length >= 3 && !hasInterveningDataRow;
     })
     .sort((a, b) => {
       const aHeading = Number(/[A-ZÅÄÖ]{3}/.test(a.text) || /^\s*(NOT|NOTE)\s+\d+/i.test(a.text));
@@ -249,26 +283,53 @@ function tableTitle(lines: PdfLine[], headerTop: number) {
   return candidates[0]?.text.trim().slice(0, 220) || "Financial table";
 }
 
-function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
+export function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
   const allowedHeaderWords = new Set([
     "as", "at", "per", "den", "jan", "january", "feb", "february", "mar", "march",
     "apr", "april", "maj", "may", "jun", "june", "jul", "july", "aug", "august",
     "sep", "september", "okt", "oct", "october", "nov", "november", "dec", "december",
-    "sek", "tsek", "ksek", "msek", "kr",
+    "sek", "sekm", "tsek", "ksek", "msek", "kr",
   ]);
+  const splitYearLine = (line: PdfLine) => {
+    const years = line.tokens
+      .map((token) => ({ token, year: yearFromToken(token) }))
+      .filter((item): item is { token: PdfToken; year: number } => item.year !== null)
+      .sort((a, b) => tokenCenter(a.token) - tokenCenter(b.token));
+    if (years.length < 2) return [{ line, years }];
+    const gaps = years.slice(1).map((item, index) => tokenCenter(item.token) - tokenCenter(years[index].token));
+    const ordinaryGaps = [...gaps].sort((a, b) => a - b).slice(0, Math.max(1, gaps.length - 1));
+    const medianGap = ordinaryGaps[Math.floor(ordinaryGaps.length / 2)] || 0;
+    const groups: typeof years[] = [[]];
+    years.forEach((item, index) => {
+      if (index > 0 && gaps[index - 1] > Math.max(120, medianGap * 1.8)) groups.push([]);
+      groups.at(-1)!.push(item);
+    });
+    if (groups.length === 1) return [{ line, years }];
+    return groups.map((group, groupIndex) => {
+      const leftEdge = groupIndex === 0
+        ? -Infinity
+        : (tokenCenter(groups[groupIndex - 1].at(-1)!.token) + tokenCenter(group[0].token)) / 2;
+      const rightEdge = groupIndex === groups.length - 1
+        ? Infinity
+        : (tokenCenter(group.at(-1)!.token) + tokenCenter(groups[groupIndex + 1][0].token)) / 2;
+      const tokens = line.tokens.filter((token) => {
+        const center = tokenCenter(token);
+        return center >= leftEdge && center < rightEdge;
+      });
+      return {
+        line: { ...line, rect: rectUnion(tokens.map((token) => token.rect)), tokens },
+        years: group,
+      };
+    });
+  };
   const yearLines = page.lines
-    .map((line) => ({
-      line,
-      years: line.tokens
-        .map((token) => ({ token, year: yearFromToken(token) }))
-        .filter((item): item is { token: PdfToken; year: number } => item.year !== null),
-    }))
+    .flatMap(splitYearLine)
     .filter(({ line, years }) => {
       if (!years.length) return false;
       const textTokens = line.tokens.filter((token) => yearFromToken(token) === null && !token.isNumber);
       const nonDateWords = textTokens
         .flatMap((token) => normalizeLabel(token.text).split(" "))
-        .filter((word) => word && !allowedHeaderWords.has(word));
+        .filter((word) => word && !allowedHeaderWords.has(word) && !/^\d+$/.test(word));
       if (nonDateWords.length === 0) return true;
       const headingText = textTokens.map((token) => token.text).join(" ").trim();
       const normalizedHeading = normalizeLabel(headingText);
@@ -284,9 +345,17 @@ function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
 
   for (const seed of yearLines) {
     const center = (seed.line.rect[1] + seed.line.rect[3]) / 2;
+    const seedMinX = Math.min(...seed.years.map((item) => tokenCenter(item.token)));
+    const seedMaxX = Math.max(...seed.years.map((item) => tokenCenter(item.token)));
     const nearby = yearLines.filter(({ line }) => {
       const otherCenter = (line.rect[1] + line.rect[3]) / 2;
-      return Math.abs(otherCenter - center) <= 30;
+      const lineYears = line.tokens
+        .map((token) => ({ token, year: yearFromToken(token) }))
+        .filter((item): item is { token: PdfToken; year: number } => item.year !== null);
+      const otherMinX = Math.min(...lineYears.map((item) => tokenCenter(item.token)));
+      const otherMaxX = Math.max(...lineYears.map((item) => tokenCenter(item.token)));
+      const horizontalGap = Math.max(0, seedMinX - otherMaxX, otherMinX - seedMaxX);
+      return Math.abs(otherCenter - center) <= 30 && horizontalGap <= 80;
     });
     const years = nearby.flatMap((item) => item.years);
     const distinct = [...new Set(years.map((item) => item.year))];
@@ -321,6 +390,9 @@ function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
         .join(" ")
         .trim();
       const normalizedInlineTitle = normalizeLabel(inlineTitle);
+      const informativeInlineWords = normalizedInlineTitle
+        .split(" ")
+        .filter((word) => word && !allowedHeaderWords.has(word) && !/^\d+$/.test(word));
       const isColumnHeading = /^(nyckeltal|key figures?|key metrics?)$/i.test(normalizedInlineTitle);
       const keyFiguresTitle = /^nyckeltal$/i.test(normalizedInlineTitle)
         ? "Flerårsöversikt"
@@ -331,17 +403,34 @@ function extractHeaderBands(page: ExtractedPage): HeaderBand[] {
         tableIndex,
         title: isColumnHeading
           ? keyFiguresTitle
-          : normalizedInlineTitle.length >= 3
+          : normalizedInlineTitle.length >= 3 && informativeInlineWords.length > 0
             ? inlineTitle.slice(0, 220)
-            : tableTitle(page.lines, rect[1]),
+            : tableTitle(page.lines, rect[1]) === "Financial table"
+              ? `Financial table ${tableIndex + 1}`
+              : tableTitle(page.lines, rect[1]),
       };
     });
 }
 
 function leadingLabel(line: PdfLine, number: PdfToken, labelCutoff: number, previous?: PdfLine) {
+  const numberIndex = line.tokens.findIndex((token) => token.id === number.id);
+  let labelStart = 0;
+  for (let index = 1; index < numberIndex; index += 1) {
+    if (
+      line.tokens[index - 1].isNumber &&
+      !line.tokens[index].isNumber &&
+      /[a-zåäö]/i.test(line.tokens[index].text)
+    ) labelStart = index;
+  }
   let tokens = line.tokens
-    .filter((token) => token.rect[2] <= Math.min(number.rect[0] + 1, labelCutoff) && !token.isNumber);
+    .slice(labelStart, numberIndex)
+    .filter((token) =>
+      token.rect[2] <= Math.min(number.rect[0] + 1, labelCutoff) &&
+      !token.isNumber &&
+      /[a-zåäö]/i.test(token.text),
+    );
   const previousIsWrapped = previous &&
+    labelStart === 0 &&
     !previous.tokens.some((token) => token.isNumber) &&
     line.rect[1] - previous.rect[3] < 16 &&
     Math.abs(previous.rect[0] - line.rect[0]) < 18 &&
@@ -366,11 +455,16 @@ function leadingLabel(line: PdfLine, number: PdfToken, labelCutoff: number, prev
   return null;
 }
 
-function nearbyRowLabels(page: ExtractedPage, lineIndex: number, labelCutoff: number) {
+function nearbyRowLabels(page: ExtractedPage, lineIndex: number, labelCutoff: number, labelStart: number) {
   return page.lines
     .slice(Math.max(0, lineIndex - 2), lineIndex + 3)
     .map((line) => line.tokens
-      .filter((token) => !token.isNumber && token.rect[2] <= labelCutoff)
+      .filter((token) =>
+        !token.isNumber &&
+        token.rect[0] >= labelStart - 4 &&
+        token.rect[2] <= labelCutoff &&
+        /[a-zåäö]/i.test(token.text),
+      )
       .map((token) => token.text)
       .join(" ")
       .trim())
@@ -409,7 +503,7 @@ function unlabeledTotalLabel(
   };
 }
 
-function extractCells(pages: ExtractedPage[]) {
+export function extractCells(pages: ExtractedPage[]) {
   const cells: ComparableCell[] = [];
   for (const page of pages) {
     const pageLevelSection = pageSection(page);
@@ -424,22 +518,27 @@ function extractCells(pages: ExtractedPage[]) {
       if (numbers.length < 2) continue;
       const y = line.rect[1];
       const pageHeight = page.bounds[3] - page.bounds[1];
-      const precedingHeaders = headerBands
-        .filter((candidate) => {
-          const center = (candidate.rect[1] + candidate.rect[3]) / 2;
-          return center <= y + 3 && y - center < Math.max(560, pageHeight * 0.7);
-        })
-        .sort((a, b) => b.rect[3] - a.rect[3]);
-      const followingHeaders = headerBands
-        .filter((candidate) => {
-          const center = (candidate.rect[1] + candidate.rect[3]) / 2;
-          return center > y + 3 && center - y < 180;
-        })
-        .sort((a, b) => a.rect[1] - b.rect[1]);
-      const header = precedingHeaders[0] || followingHeaders[0];
-      if (!header) continue;
 
       for (const number of numbers) {
+        const headerCandidates = headerBands.map((candidate) => ({
+          candidate,
+          vertical: y - candidate.rect[3],
+          horizontal: Math.min(...candidate.years.map((item) =>
+            Math.abs(tokenCenter(item.token) - tokenCenter(number)),
+          )),
+        }));
+        const maximumPrecedingDistance = Math.max(560, pageHeight * 0.7);
+        const precedingHeaders = headerCandidates.filter(
+          (item) => item.vertical >= -4 && item.vertical < maximumPrecedingDistance,
+        );
+        const header = (precedingHeaders.length
+          ? precedingHeaders
+          : headerCandidates.filter((item) => item.vertical < -4 && Math.abs(item.vertical) < 180))
+          .sort((a, b) =>
+            a.horizontal + Math.abs(a.vertical) * 0.35 -
+            (b.horizontal + Math.abs(b.vertical) * 0.35),
+          )[0]?.candidate;
+        if (!header) continue;
         const sortedYears = [...header.years].sort((a, b) => tokenCenter(a.token) - tokenCenter(b.token));
         const nearest = [...sortedYears].sort(
           (a, b) =>
@@ -487,7 +586,7 @@ function extractCells(pages: ExtractedPage[]) {
           labelRect: labelInfo!.rect,
           yearRect: nearest.token.rect,
           tableTitle: header.title,
-          nearbyRows: nearbyRowLabels(page, index, labelCutoff),
+          nearbyRows: nearbyRowLabels(page, index, labelCutoff, labelInfo!.rect[0]),
           structuralLabel: Boolean(structuralLabelInfo),
         });
       }
@@ -561,6 +660,7 @@ function bestCandidate(cell: ComparableCell, candidates: ComparableCell[]) {
   const exactSameContext = exactCandidates.filter((item) => sameTable(item.candidate));
   const confidentMismatch =
     best.exactLabel &&
+    !isBareResidualLabel(cell) &&
     !cell.structuralLabel &&
     !best.candidate.structuralLabel &&
     sameTable(best.candidate) &&
@@ -630,6 +730,47 @@ function isBareResidualLabel(cell: ComparableCell) {
   return new Set(["ovrigt", "ovriga", "other", "miscellaneous"]).has(cell.normalizedLabel);
 }
 
+function sharedNearbyRows(newer: ComparableCell, older: ComparableCell) {
+  const usedOlder = new Set<number>();
+  const shared: string[] = [];
+  for (const label of newer.nearbyRows) {
+    const normalized = normalizeLabel(label);
+    if (!normalized) continue;
+    const matchIndex = older.nearbyRows.findIndex(
+      (candidate, index) =>
+        !usedOlder.has(index) &&
+        labelSimilarity(normalized, normalizeLabel(candidate), true) >= 0.72,
+    );
+    if (matchIndex >= 0) {
+      usedOlder.add(matchIndex);
+      shared.push(label);
+    }
+  }
+  return shared.slice(0, 5);
+}
+
+function directEvidence(newer: ComparableCell, older: ComparableCell): DirectCandidate["evidence"] {
+  const samePdfPage = newer.page === older.page;
+  const rowDistancePoints = samePdfPage
+    ? Math.round(Math.abs(newer.token.rect[1] - older.token.rect[1]) * 10) / 10
+    : null;
+  return {
+    deterministicEqual: arithmeticEqual(newer.value, older.value),
+    sameReportedYear: newer.year === older.year,
+    samePdfPage,
+    pageDelta: Math.abs(newer.page - older.page),
+    sameTableOrdinal: samePdfPage && newer.tableIndex === older.tableIndex,
+    sameSection: newer.section === older.section,
+    tableTitleSimilarity: Math.round(
+      labelSimilarity(normalizeLabel(newer.tableTitle), normalizeLabel(older.tableTitle), true) * 100,
+    ) / 100,
+    rowDistancePoints,
+    sameRowPosition: rowDistancePoints !== null && rowDistancePoints <= 42,
+    damagedGlyph: /�/.test(`${newer.label} ${older.label} ${newer.tableTitle} ${older.tableTitle}`),
+    sharedNearbyRows: sharedNearbyRows(newer, older),
+  };
+}
+
 function buildDirectEqualityProposals(
   unresolved: Array<{ cell: ComparableCell; match: ReturnType<typeof bestCandidate> }>,
   olderCandidates: ComparableCell[],
@@ -643,8 +784,11 @@ function buildDirectEqualityProposals(
         if (
           candidate.year !== cell.year ||
           protectedOlderIds.has(candidate.id) ||
-          candidate.value === 0 ||
           !arithmeticEqual(cell.value, candidate.value)
+        ) return false;
+        if (
+          Math.abs(cell.value) <= 1 &&
+          labelSimilarity(cell.normalizedLabel, candidate.normalizedLabel, true) < 0.55
         ) return false;
         const pageDistance = Math.abs(candidate.page - cell.page);
         return sameTableContext(cell, candidate) ||
@@ -885,12 +1029,13 @@ export async function analyzePair(
       .map((item) => [item.cell.id, item.match!.candidate.id]),
   );
   const mappings: ModelMapping[] = [];
+  const modelReviews = new Map<string, ModelReview>();
   let batchesAttempted = 0;
   let batchesFailed = 0;
   let mappingsRejected = 0;
 
   if (unresolved.length && options?.resolveLabels) {
-    const batchSize = 20;
+    const batchSize = 12;
     const batches = Array.from(
       { length: Math.ceil(unresolved.length / batchSize) },
       (_, index) => unresolved.slice(index * batchSize, (index + 1) * batchSize),
@@ -928,17 +1073,58 @@ export async function analyzePair(
         batch.flatMap(({ cell }) => (olderByYear.get(cell.year) || []).map((candidate) => [candidate.id, candidate] as const)),
       ).values()];
       const discoveredDirect = buildDirectEqualityProposals(batch, directDiscoveryPool, protectedOlderIds);
+      const directPairs: DirectCandidate[] = [];
+      const directPairSignatures = new Set<string>();
       for (const proposal of discoveredDirect) {
-        for (const id of proposal.olderIds) {
-          const candidate = olderById.get(id);
-          if (candidate) olderCandidates.set(id, candidate);
-        }
+        const newer = newerById.get(proposal.newerIds[0]);
+        const older = olderById.get(proposal.olderIds[0]);
+        if (!newer || !older) continue;
+        const signature = mappingSignature([newer.id], [older.id]);
+        if (directPairSignatures.has(signature)) continue;
+        directPairSignatures.add(signature);
+        olderCandidates.set(older.id, older);
+        directPairs.push({ newerId: newer.id, olderId: older.id, evidence: directEvidence(newer, older) });
       }
+
+      // Preserve one plausible unequal candidate as review provenance when no
+      // equal candidate exists. Jev may reject it, but application validation
+      // never permits an unequal semantic mapping to become green or red.
+      batch.forEach(({ cell }, rowIndex) => {
+        if (directPairs.some((pair) => pair.newerId === cell.id)) return;
+        const prepared = (candidateLists[rowIndex] || []).map((candidate) => {
+          const evidence = directEvidence(cell, candidate);
+          const semanticRetrieval = labelSimilarity(cell.normalizedLabel, candidate.normalizedLabel, true);
+          const residualUnequal = isBareResidualLabel(cell) &&
+            candidate.normalizedLabel === cell.normalizedLabel &&
+            !evidence.deterministicEqual;
+          const unsafeTrivialCoincidence = Math.abs(cell.value) <= 1 && semanticRetrieval < 0.55;
+          const plausibleContext = semanticRetrieval >= 0.32 ||
+            (evidence.sameRowPosition && evidence.sameTableOrdinal && evidence.sameSection &&
+              evidence.tableTitleSimilarity >= 0.8) ||
+            evidence.sharedNearbyRows.length >= 3;
+          return { candidate, evidence, residualUnequal, unsafeTrivialCoincidence, plausibleContext };
+        });
+        const selected = prepared.find((item) =>
+          item.plausibleContext && !item.residualUnequal && !item.unsafeTrivialCoincidence,
+        );
+        if (!selected) return;
+        const signature = mappingSignature([cell.id], [selected.candidate.id]);
+        if (directPairSignatures.has(signature)) return;
+        directPairSignatures.add(signature);
+        olderCandidates.set(selected.candidate.id, selected.candidate);
+        directPairs.push({
+          newerId: cell.id,
+          olderId: selected.candidate.id,
+          evidence: selected.evidence,
+        });
+      });
+
       const contextualOlderCells = [...olderCandidates.values()];
-      const discoveredGroups = [
-        ...discoveredDirect,
-        ...buildArithmeticProposals(batch, contextualOlderCells, protectedOlderIds),
-      ].slice(0, 80);
+      const discoveredGroups = buildArithmeticProposals(
+        batch,
+        contextualOlderCells,
+        protectedOlderIds,
+      ).slice(0, 80);
       const selectedOlderIds = new Set<string>();
       const candidateLimit = 160;
 
@@ -950,6 +1136,9 @@ export async function analyzePair(
         if (item.match?.candidate.id && selectedOlderIds.size < candidateLimit) {
           selectedOlderIds.add(item.match.candidate.id);
         }
+      }
+      for (const pair of directPairs) {
+        if (selectedOlderIds.size < candidateLimit) selectedOlderIds.add(pair.olderId);
       }
       const proposedGroups: DeterministicProposal[] = [];
       for (const group of discoveredGroups) {
@@ -969,18 +1158,18 @@ export async function analyzePair(
         .map((id) => olderCandidates.get(id))
         .filter(Boolean) as ComparableCell[];
       const olderRows = olderCandidateCells.map(toModelRow);
-      if (!newerRows.length || !olderRows.length) continue;
+      if (!newerRows.length || !olderRows.length || (!directPairs.length && !proposedGroups.length)) continue;
       batchesAttempted += 1;
 
       const batchLabel = batches.length > 1 ? ` (batch ${batchIndex + 1}/${batches.length})` : "";
       options.onProgress?.(
         0.9 + ((batchIndex + 1) / batches.length) * 0.07,
-        (proposedGroups.some((group) => group.relationship === "aggregate")
-          ? "Validating arithmetic row groups with the selected model"
-          : "Resolving renamed rows with the selected model") + batchLabel,
+        (proposedGroups.length
+          ? "Validating arithmetic row groups with Jev"
+          : "Resolving renamed rows with Jev") + batchLabel,
       );
       try {
-        const response = await options.resolveLabels(newerRows, olderRows, proposedGroups, {
+        const response = await options.resolveLabels(newerRows, olderRows, proposedGroups, directPairs, {
           index: batchIndex + 1,
           count: batches.length,
         });
@@ -989,6 +1178,24 @@ export async function analyzePair(
         const proposedSignatures = new Set(
           proposedGroups.map((group) => mappingSignature(group.newerIds, group.olderIds)),
         );
+        for (const review of response.reviews || []) {
+          if (
+            !validNewerIds.has(String(review.newerId)) ||
+            !validOlderIds.has(String(review.olderId)) ||
+            !["unlinked", "review", "aligned"].includes(review.decision) ||
+            review.judgment?.basis !== "jev"
+          ) continue;
+          const probability = Number(review.judgment.outcomeProbability);
+          if (!Number.isFinite(probability) || probability < 0 || probability > 1) continue;
+          const current = modelReviews.get(String(review.newerId));
+          if (!current || probability > Number(current.judgment.outcomeProbability || 0)) {
+            modelReviews.set(String(review.newerId), {
+              ...review,
+              newerId: String(review.newerId),
+              olderId: String(review.olderId),
+            });
+          }
+        }
         // A model can occasionally return both the supplied aggregate and a
         // competing one-to-one mapping for its anchor row. Apply the aggregate
         // first so the exact, deterministically verified regrouping is not
@@ -1012,9 +1219,10 @@ export async function analyzePair(
             ...mappedNewerIds.map((id) => newerById.get(id)?.year),
             ...mappedOlderIds.map((id) => olderById.get(id)?.year),
           ]);
-          const isApprovedProposal = mapping.relationship !== "aggregate" || proposedSignatures.has(
-            mappingSignature(mappedNewerIds, mappedOlderIds),
-          );
+          const signature = mappingSignature(mappedNewerIds, mappedOlderIds);
+          const isApprovedProposal = mapping.relationship === "aggregate"
+            ? proposedSignatures.has(signature)
+            : directPairSignatures.has(signature);
           const arithmeticAgrees = mapping.relationship !== "aggregate" || arithmeticEqual(
             mappedNewerIds.reduce((sum, id) => sum + (newerById.get(id)?.value || 0), 0),
             mappedOlderIds.reduce((sum, id) => sum + (olderById.get(id)?.value || 0), 0),
@@ -1048,34 +1256,32 @@ export async function analyzePair(
       // but that judgment is easily lost in a large candidate prompt. Retry only
       // the still-unresolved, deterministically equal residual-to-specific pairs
       // once, with their existing structural context and no unrelated rows.
-      const focusedResidualProposals = proposedGroups.filter((proposal) => {
-        if (proposal.relationship !== "direct" || proposal.newerIds.length !== 1 || proposal.olderIds.length !== 1) {
-          return false;
-        }
-        const newer = newerById.get(proposal.newerIds[0]);
-        const older = olderById.get(proposal.olderIds[0]);
+      const focusedResidualPairs = directPairs.filter((pair) => {
+        const newer = newerById.get(pair.newerId);
+        const older = olderById.get(pair.olderId);
         return Boolean(
           newer && older &&
+          pair.evidence.deterministicEqual &&
           !usedNewer.has(newer.id) &&
           !usedOlder.has(older.id) &&
           isBareResidualLabel(newer) !== isBareResidualLabel(older),
         );
       });
-      if (focusedResidualProposals.length) {
+      if (focusedResidualPairs.length) {
         const focusedNewer = [...new Map(
-          focusedResidualProposals.map((proposal) => {
-            const cell = newerById.get(proposal.newerIds[0])!;
+          focusedResidualPairs.map((pair) => {
+            const cell = newerById.get(pair.newerId)!;
             return [cell.id, toModelRow(cell)] as const;
           }),
         ).values()];
         const focusedOlder = [...new Map(
-          focusedResidualProposals.map((proposal) => {
-            const cell = olderById.get(proposal.olderIds[0])!;
+          focusedResidualPairs.map((pair) => {
+            const cell = olderById.get(pair.olderId)!;
             return [cell.id, toModelRow(cell)] as const;
           }),
         ).values()];
         const allowedSignatures = new Set(
-          focusedResidualProposals.map((proposal) => mappingSignature(proposal.newerIds, proposal.olderIds)),
+          focusedResidualPairs.map((pair) => mappingSignature([pair.newerId], [pair.olderId])),
         );
         batchesAttempted += 1;
         options.onProgress?.(
@@ -1083,7 +1289,7 @@ export async function analyzePair(
           `Rechecking a contextual residual mapping${batchLabel}`,
         );
         try {
-          const response = await options.resolveLabels(focusedNewer, focusedOlder, focusedResidualProposals, {
+          const response = await options.resolveLabels(focusedNewer, focusedOlder, [], focusedResidualPairs, {
             index: batchIndex + 1,
             count: batches.length,
           });
@@ -1167,12 +1373,12 @@ export async function analyzePair(
           valueOld: olderExpression,
           matchMethod: "model",
           explanation: isArithmetic
-            ? `${newerGroup[0].year}: ${newerExpression} ${operator} ${olderExpression}. The model identified a semantically coherent split/merge; the totals were checked deterministically.`
+            ? `${newerGroup[0].year}: ${newerExpression} ${operator} ${olderExpression}. Jev identified a semantically coherent split/merge; the totals were checked deterministically.`
             : equal
               ? describe("match", newerGroup[0], olderGroup[0], olderExpression)
               : exactAlignedDirect
                 ? describe("mismatch", newerGroup[0], olderGroup[0], olderExpression)
-                : `${newerGroup[0].year}: the model found a possible renamed counterpart, but unequal values require a unique exact-label deterministic alignment before a discrepancy can be flagged.`,
+                : `${newerGroup[0].year}: Jev found a possible renamed counterpart, but unequal values require a unique exact-label deterministic alignment before a discrepancy can be flagged.`,
           newer: evidence(newerGroup[0]),
           older: evidence(olderGroup[0]),
           newerRelated: newerGroup.slice(1).map(evidence),
@@ -1207,12 +1413,14 @@ export async function analyzePair(
             modelRole: isArithmetic ? "arithmetic-coherence" : "rename",
             modelReason: mapping.reason?.slice(0, 500),
           },
+          judgment: mapping.judgment || { basis: "jev" },
         });
         continue;
       }
     }
 
     const source = match?.candidate;
+    const review = modelReviews.get(cell.id);
     const method: Discrepancy["matchMethod"] = match
       ? match.exactLabel && !match.damagedExact ? "exact" : "similar"
       : "none";
@@ -1241,6 +1449,8 @@ export async function analyzePair(
       matchMethod: method,
       explanation: counterpartReused
         ? `${cell.year}: this prior-report occurrence was claimed by more than one newer row, so the alignment was not judged.`
+        : review && status === "missing"
+          ? `${cell.year}: Jev reviewed possible counterparts but did not approve a reliable alignment. The control remains unresolved.`
         : status === "match" && (cell.structuralLabel || source?.structuralLabel)
           ? `${cell.year}: the unlabeled numeric row immediately below a horizontal total rule agrees with the corresponding ruled row in the prior report (${source?.valueText}).`
         : describe(status, cell, source, source?.valueText, comparedValue !== null && status === "missing"),
@@ -1282,8 +1492,12 @@ export async function analyzePair(
         deterministic: true,
         normalizedNewer: cell.value,
         normalizedOlder: source?.value,
-        modelRole: "none",
+        modelRole: review ? "rename" : "none",
+        modelReason: review
+          ? `Jev decision: ${review.decision}; approval probability ${Math.round((review.judgment.outcomeProbability || 0) * 100)}%.`
+          : undefined,
       },
+      judgment: review?.judgment || { basis: "deterministic" },
     });
   }
 

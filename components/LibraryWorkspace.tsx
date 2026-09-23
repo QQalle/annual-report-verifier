@@ -16,7 +16,6 @@ import {
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { reportPairs } from "@/lib/catalog";
-import { useModel } from "@/lib/model-context";
 import { alterNumber, BrowserPdf, fetchCataloguePdf } from "@/lib/pdf-engine";
 import type { PdfToken, ReportPair, ScrambleChange } from "@/lib/types";
 import { PdfViewer } from "./PdfViewer";
@@ -137,11 +136,9 @@ export function LibraryWorkspace() {
   const [scrambleMode, setScrambleMode] = useState(false);
   const [selectedToken, setSelectedToken] = useState<SelectedToken | null>(null);
   const [replacement, setReplacement] = useState("");
-  const [suggesting, setSuggesting] = useState(false);
   const [editorError, setEditorError] = useState<string | null>(null);
   const [latestRevision, setLatestRevision] = useState(0);
   const [previousRevision, setPreviousRevision] = useState(0);
-  const { isConfigured, callModel, provider } = useModel();
   const documentsRef = useRef<LoadedPair>({ latest: null, previous: null });
 
   useEffect(() => () => {
@@ -260,31 +257,6 @@ export function LibraryWorkspace() {
     setSelectedToken({ side, token });
     setReplacement(token.isNumber ? alterNumber(token.text) : "");
     setEditorError(null);
-  };
-
-  const suggestSynonym = async () => {
-    if (!selectedToken || selectedToken.token.isNumber) return;
-    if (!isConfigured) {
-      setEditorError(`Add an ${provider === "openai" ? "OpenAI" : "Anthropic"} key in the model sidebar to suggest a synonym.`);
-      return;
-    }
-    const pdf = documents[selectedToken.side];
-    if (!pdf) return;
-    setSuggesting(true);
-    setEditorError(null);
-    try {
-      const page = await pdf.extractPage(selectedToken.token.page);
-      const context = page.lines.find((line) => line.id === selectedToken.token.lineId)?.text || "";
-      const result = await callModel<{ synonym: string; reason: string }>("synonym", {
-        word: selectedToken.token.text,
-        context,
-      });
-      setReplacement(result.synonym);
-    } catch (error) {
-      setEditorError(error instanceof Error ? error.message : "Could not suggest a synonym");
-    } finally {
-      setSuggesting(false);
-    }
   };
 
   const applyReplacement = async () => {
@@ -528,12 +500,6 @@ export function LibraryWorkspace() {
               placeholder={selectedToken.token.isNumber ? "Altered number" : "Replacement word"}
               autoFocus
             />
-            {!selectedToken.token.isNumber && (
-              <button className="button secondary" type="button" onClick={suggestSynonym} disabled={suggesting}>
-                {suggesting ? <LoaderCircle size={14} className="spin" /> : <Sparkles size={14} />}
-                Suggest
-              </button>
-            )}
             <button className="button primary" type="button" onClick={applyReplacement} disabled={!replacement.trim()}>
               Apply
             </button>

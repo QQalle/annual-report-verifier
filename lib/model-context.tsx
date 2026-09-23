@@ -9,20 +9,18 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { ModelCall, ModelProvider, ModelUsage } from "./types";
-import { DEFAULT_MODELS, selectConfiguredProvider, type ModelId } from "./model-config";
+import type { ModelCall, ModelUsage } from "./types";
+import { DEFAULT_MODEL, type ModelId } from "./model-config";
 
 type ModelPurpose = ModelCall["purpose"];
-type ProviderMap<T> = Record<ModelProvider, T>;
 
 type ModelContextValue = {
-  provider: ModelProvider;
-  setProvider: (provider: ModelProvider) => void;
+  provider: "typesafe";
   model: ModelId;
   setModel: (model: ModelId) => void;
   apiKey: string;
   setApiKey: (value: string) => void;
-  envConfigured: ProviderMap<boolean>;
+  envConfigured: boolean;
   isConfigured: boolean;
   calls: ModelCall[];
   clearCalls: () => void;
@@ -40,37 +38,24 @@ const emptyUsage: ModelUsage = {
 };
 
 export function ModelProviderRoot({ children }: { children: ReactNode }) {
-  const [provider, setProvider] = useState<ModelProvider>("openai");
-  const [models, setModels] = useState<Record<ModelProvider, ModelId>>(DEFAULT_MODELS);
-  const [apiKeys, setApiKeys] = useState<ProviderMap<string>>({ openai: "", anthropic: "" });
-  const [envConfigured, setEnvConfigured] = useState<ProviderMap<boolean>>({
-    openai: false,
-    anthropic: false,
-  });
+  const [model, setModel] = useState<ModelId>(DEFAULT_MODEL);
+  const [apiKey, setApiKey] = useState("");
+  const [envConfigured, setEnvConfigured] = useState(false);
   const [calls, setCalls] = useState<ModelCall[]>([]);
 
   useEffect(() => {
     fetch("/api/model")
       .then((response) => response.json())
-      .then((data) => {
-        const configured = {
-          openai: Boolean(data.openai),
-          anthropic: Boolean(data.anthropic),
-        };
-        setEnvConfigured(configured);
-        setProvider((current) => selectConfiguredProvider(current, configured));
-      })
-      .catch(() => setEnvConfigured({ openai: false, anthropic: false }));
+      .then((data) => setEnvConfigured(Boolean(data.typesafe)))
+      .catch(() => setEnvConfigured(false));
   }, []);
 
   const callModel = useCallback(
     async <T,>(purpose: ModelPurpose, payload: unknown, keyOverride?: string): Promise<T> => {
-      const activeProvider = provider;
-      const activeModel = models[activeProvider];
       const id = crypto.randomUUID();
       const createdAt = new Date().toISOString();
       setCalls((current) => [
-        { id, provider: activeProvider, model: activeModel, purpose, createdAt, status: "pending", request: payload },
+        { id, provider: "typesafe", model, purpose, createdAt, status: "pending", request: payload },
         ...current,
       ]);
 
@@ -79,16 +64,15 @@ export function ModelProviderRoot({ children }: { children: ReactNode }) {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            provider: activeProvider,
-            model: activeModel,
-            apiKey: keyOverride || apiKeys[activeProvider] || undefined,
+            model,
+            apiKey: keyOverride || apiKey || undefined,
             purpose,
             payload,
           }),
         });
         const data = await response.json();
         if (!response.ok) {
-          const message = data.error || "Model request failed";
+          const message = data.error || "TypeSafe request failed";
           setCalls((current) =>
             current.map((call) =>
               call.id === id
@@ -112,6 +96,7 @@ export function ModelProviderRoot({ children }: { children: ReactNode }) {
             call.id === id
               ? {
                   ...call,
+                  model: data.response?.model || call.model,
                   status: "success",
                   request: data.request,
                   response: data.response,
@@ -124,7 +109,7 @@ export function ModelProviderRoot({ children }: { children: ReactNode }) {
         );
         return data.parsed as T;
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Model request failed";
+        const message = error instanceof Error ? error.message : "TypeSafe request failed";
         setCalls((current) =>
           current.map((call) =>
             call.id === id ? { ...call, status: "error", error: message } : call,
@@ -133,7 +118,7 @@ export function ModelProviderRoot({ children }: { children: ReactNode }) {
         throw error;
       }
     },
-    [apiKeys, models, provider],
+    [apiKey, model],
   );
 
   const totalUsage = useMemo(
@@ -154,20 +139,19 @@ export function ModelProviderRoot({ children }: { children: ReactNode }) {
 
   const value = useMemo<ModelContextValue>(
     () => ({
-      provider,
-      setProvider,
-      model: models[provider],
-      setModel: (model) => setModels((current) => ({ ...current, [provider]: model })),
-      apiKey: apiKeys[provider],
-      setApiKey: (value) => setApiKeys((current) => ({ ...current, [provider]: value })),
+      provider: "typesafe",
+      model,
+      setModel,
+      apiKey,
+      setApiKey,
       envConfigured,
-      isConfigured: Boolean(apiKeys[provider]) || envConfigured[provider],
+      isConfigured: Boolean(apiKey) || envConfigured,
       calls,
       clearCalls: () => setCalls([]),
       callModel,
       totalUsage,
     }),
-    [apiKeys, models, provider, envConfigured, calls, callModel, totalUsage],
+    [apiKey, model, envConfigured, calls, callModel, totalUsage],
   );
 
   return <ModelContext.Provider value={value}>{children}</ModelContext.Provider>;

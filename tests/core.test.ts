@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { requestDefinition, validateModelResult } from "../app/api/model/route.ts";
-import { analyzePair } from "../lib/compare.ts";
-import { selectConfiguredProvider } from "../lib/model-config.ts";
+import { buildTypeSafeRequest, mappingsFromTypeSafe } from "../app/api/model/route.ts";
+import { analyzePair, extractCells, extractHeaderBands } from "../lib/compare.ts";
+import { DEFAULT_MODEL, isModel } from "../lib/model-config.ts";
 import type { BrowserPdf } from "../lib/pdf-engine.ts";
 import { alterNumber, isNumberText, mergeTextFragments, parseSwedishNumber } from "../lib/pdf-engine.ts";
 import type { ExtractedPage, PdfLine, PdfToken, Rect } from "../lib/types.ts";
@@ -128,6 +128,59 @@ function keyFiguresPage(
   };
 }
 
+function sideBySideKeyFiguresPage(
+  page: number,
+  years: [number, number],
+  left: { label: string; values: [number, number] },
+  right: { label: string; values: [number, number] },
+): ExtractedPage {
+  const titleId = `p${page}-side-title`;
+  const headerId = `p${page}-side-header`;
+  const rowId = `p${page}-side-row`;
+  const lines: PdfLine[] = [
+    {
+      id: titleId,
+      page,
+      text: "Five-year overview",
+      rect: [30, 20, 210, 34],
+      tokens: [token(`${titleId}-text`, page, "Five-year overview", [30, 20, 210, 34], false, titleId)],
+    },
+    {
+      id: headerId,
+      page,
+      text: `${years[0]} ${years[1]} ${years[0]} ${years[1]}`,
+      rect: [280, 50, 920, 62],
+      tokens: [
+        token(`${headerId}-left-0`, page, String(years[0]), [280, 50, 320, 62], true, headerId),
+        token(`${headerId}-left-1`, page, String(years[1]), [380, 50, 420, 62], true, headerId),
+        token(`${headerId}-right-0`, page, String(years[0]), [780, 50, 820, 62], true, headerId),
+        token(`${headerId}-right-1`, page, String(years[1]), [880, 50, 920, 62], true, headerId),
+      ],
+    },
+    {
+      id: rowId,
+      page,
+      text: `${left.label} ${left.values.join(" ")} ${right.label} ${right.values.join(" ")}`,
+      rect: [30, 90, 910, 102],
+      tokens: [
+        token(`${rowId}-left-label`, page, left.label, [30, 90, 200, 102], false, rowId),
+        token(`${rowId}-left-0`, page, String(left.values[0]), [290, 90, 315, 102], true, rowId),
+        token(`${rowId}-left-1`, page, String(left.values[1]), [390, 90, 415, 102], true, rowId),
+        token(`${rowId}-right-label`, page, right.label, [530, 90, 700, 102], false, rowId),
+        token(`${rowId}-right-0`, page, String(right.values[0]), [790, 90, 815, 102], true, rowId),
+        token(`${rowId}-right-1`, page, String(right.values[1]), [890, 90, 915, 102], true, rowId),
+      ],
+    },
+  ];
+  return {
+    page,
+    bounds: [0, 0, 1000, 800],
+    text: lines.map((line) => line.text).join("\n"),
+    tokens: lines.flatMap((line) => line.tokens),
+    lines,
+  };
+}
+
 function mockPdf(pages: ExtractedPage[]) {
   return {
     extractAll: async (onProgress?: (progress: number) => void) => {
@@ -166,9 +219,10 @@ test("parses annual-report number formats", () => {
   assert.equal(parseSwedishNumber("not a number"), null);
 });
 
-test("selects Anthropic automatically when it is the only configured provider", () => {
-  assert.equal(selectConfiguredProvider("openai", { openai: false, anthropic: true }), "anthropic");
-  assert.equal(selectConfiguredProvider("openai", { openai: true, anthropic: true }), "openai");
+test("pins the audited Jev model by default", () => {
+  assert.equal(DEFAULT_MODEL, "jev-1.13.0");
+  assert.equal(isModel("jev-latest"), true);
+  assert.equal(isModel("gpt-5.6"), false);
 });
 
 test("recognizes complete numeric tokens only", () => {
@@ -219,6 +273,39 @@ test("recognizes a multi-year NYCKELTAL header and compares the whole page", asy
   assert.equal(result.discrepancies.length, 9);
   assert.ok(result.discrepancies.every((item) => item.status === "match"));
   assert.deepEqual([...new Set(result.discrepancies.map((item) => item.section))], ["Multi-year overview"]);
+});
+
+test("keeps side-by-side key-figure tables in separate horizontal contexts", async () => {
+  const newer = sideBySideKeyFiguresPage(
+    0,
+    [2025, 2024],
+    { label: "Net sales growth, %", values: [4.5, -9.9] },
+    { label: "Earnings per share, SEK", values: [10.59, 10.45] },
+  );
+  const older = sideBySideKeyFiguresPage(
+    0,
+    [2024, 2023],
+    { label: "Net sales growth, %", values: [-9.9, -2.4] },
+    { label: "Earnings per share, SEK", values: [10.45, 12.19] },
+  );
+  assert.equal(extractHeaderBands(newer).length, 2);
+  assert.deepEqual(
+    extractCells([newer]).map((cell) => [cell.label, cell.year, cell.valueText]),
+    [
+      ["Net sales growth, %", 2025, "4.5"],
+      ["Net sales growth, %", 2024, "-9.9"],
+      ["Earnings per share, SEK", 2025, "10.59"],
+      ["Earnings per share, SEK", 2024, "10.45"],
+    ],
+  );
+  const result = await analyzePair(mockPdf([newer]), mockPdf([older]), 2025, 2024);
+  assert.deepEqual(
+    result.discrepancies.map((item) => [item.labelNew, item.valueNew, item.status]),
+    [
+      ["Net sales growth, %", "-9.9", "match"],
+      ["Earnings per share, SEK", "10.45", "match"],
+    ],
+  );
 });
 
 test("a preceding year header remains associated with the end of a long table", async () => {
@@ -346,6 +433,73 @@ test("matches an equal row when the prior PDF text layer has a damaged glyph", a
 
   const result = await analyzePair(mockPdf(newer), mockPdf([damagedOlderPage]), 2025, 2024);
   assert.equal(result.discrepancies[0].status, "match");
+});
+
+test("a unique unequal row remains red when the prior PDF text layer has damaged glyphs", async () => {
+  const newer = [reportPage(0, [2024, 2023], [{
+    label: "Årsavgift per kvm upplåten bostadsrätt, kr",
+    values: [800, 693],
+  }], { title: "FLERÅRSÖVERSIKT" })];
+  const older = [reportPage(0, [2023, 2022], [{
+    label: "Årsavgi� per kvm upplåten bostadsrä�, kr",
+    values: [692, 600],
+  }], { title: "FLERÅRSÖVERSIKT" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].valueNew, "693");
+  assert.equal(result.discrepancies[0].valueOld, "692");
+  assert.equal(result.discrepancies[0].judgment.basis, "deterministic");
+});
+
+test("a row above the next note header stays owned by its preceding table", () => {
+  const first = reportPage(0, [2024, 2023], [{
+    label: "Bankkostnader",
+    values: [6798, 6348],
+  }], {
+    title: "NOT 8, ÖVRIGA EXTERNA KOSTNADER",
+    inlineTitle: true,
+    headerY: 50,
+    rowStart: 145,
+  });
+  const second = reportPage(1, [2024, 2023], [], {
+    title: "NOT 9, PERSONALKOSTNADER",
+    inlineTitle: true,
+    headerY: 170,
+  });
+  const combined: ExtractedPage = {
+    ...first,
+    lines: [...first.lines, ...second.lines],
+    tokens: [...first.tokens, ...second.tokens],
+    text: [...first.lines, ...second.lines].map((line) => line.text).join("\n"),
+  };
+
+  const bankCells = extractCells([combined]).filter((cell) => cell.label === "Bankkostnader");
+  assert.equal(bankCells.length, 2);
+  assert.ok(bankCells.every((cell) => cell.tableTitle === "NOT 8, ÖVRIGA EXTERNA KOSTNADER"));
+});
+
+test("a completed table title is not inherited by a later untitled table", () => {
+  const first = reportPage(0, [2024, 2023], [{ label: "Taxeringsvärde", values: [500, 480] }], {
+    title: "Taxeringsvärde",
+    headerY: 50,
+    rowStart: 80,
+  });
+  const second = reportPage(1, [2024, 2023], [{ label: "Ingående anskaffningsvärde", values: [272414, 250000] }], {
+    headerY: 180,
+    rowStart: 210,
+  });
+  const combined: ExtractedPage = {
+    ...first,
+    lines: [...first.lines, ...second.lines],
+    tokens: [...first.tokens, ...second.tokens],
+    text: [...first.lines, ...second.lines].map((line) => line.text).join("\n"),
+  };
+
+  const bands = extractHeaderBands(combined);
+  assert.equal(bands.length, 2);
+  assert.equal(bands[0].title, "Taxeringsvärde");
+  assert.equal(bands[1].title, "Financial table 2");
 });
 
 test("keeps values that happen to look like calendar years", async () => {
@@ -489,6 +643,32 @@ test("unequal duplicate rows stay gray when their alignment is uncertain", async
   assert.equal(result.discrepancies[0].status, "missing");
 });
 
+test("equal trivial-value rows with unrelated labels are not offered as semantic matches", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Tak", values: [0, 0] },
+    { label: "Öres- och kronutjämning", values: [-1, -1] },
+  ], {
+    title: "NOT 5, UNDERHÅLL",
+  })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Balkonger", values: [0, 0] },
+    { label: "Övriga rörelseintäkter", values: [-1, -1] },
+  ], {
+    title: "NOT 5, UNDERHÅLL",
+  })];
+  let directPairCount = -1;
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (_newerRows, _olderRows, _groups, directPairs) => {
+      directPairCount = directPairs.length;
+      return { mappings: [] };
+    },
+  });
+
+  assert.ok(directPairCount <= 0);
+  assert.ok(result.discrepancies.every((item) => item.status === "missing"));
+  assert.equal(result.modelAssisted, 0);
+});
+
 test("a unique exact row with unequal values is a discrepancy", async () => {
   const newer = [reportPage(0, [2025, 2024], [{ label: "Nettoomsättning", values: [130, 101] }], { title: "NOT 2, INTÄKTER" })];
   const older = [reportPage(0, [2024, 2023], [{ label: "Nettoomsättning", values: [100, 80] }], { title: "NOT 2, INTÄKTER" })];
@@ -554,6 +734,17 @@ test("one prior occurrence cannot verify two newer rows", async () => {
   assert.ok(result.discrepancies.every((item) => item.evidence.reason === "counterpart-reused"));
 });
 
+test("an exact label in a different statement context stays gray", async () => {
+  const newer = [reportPage(0, [2024, 2023], [{ label: "Taxes", values: [-8, -9] }], {
+    title: "Parent Company income statement",
+  })];
+  const older = [reportPage(0, [2023, 2022], [{ label: "Taxes", values: [-321, -373] }], {
+    title: "Consolidated income statement",
+  })];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  assert.equal(result.discrepancies[0].status, "missing");
+});
+
 test("model-assisted renamed rows use occurrence IDs and structural context", async () => {
   const newer = [reportPage(0, [2025, 2024], [{ label: "Nettoomsättning", values: [130, 100] }], { title: "NOT 2, NETTOOMSÄTTNING", inlineTitle: true })];
   const older = [reportPage(0, [2024, 2023], [{ label: "Rörelsens intäkter", values: [100, 80] }], { title: "NOT 2, NETTOOMSÄTTNING", inlineTitle: true })];
@@ -577,6 +768,124 @@ test("model-assisted renamed rows use occurrence IDs and structural context", as
   assert.equal(result.discrepancies[0].matchMethod, "model");
 });
 
+test("Jev receives deterministic evidence for the expected Note 5 and salary renames", async () => {
+  const newer = [reportPage(0, [2024, 2023], [
+    { label: "Reparationer", values: [70000, 68061] },
+    { label: "Försäkringsärende/vattenskada", values: [28000, 25383] },
+    { label: "Löner, arbetare", values: [55000, 53250] },
+    { label: "Sociala avgifter", values: [18000, 17000] },
+  ], { title: "NOT 5, FASTIGHETSKOSTNADER", inlineTitle: true })];
+  const older = [reportPage(0, [2023, 2022], [
+    { label: "Övriga repara�oner", values: [68061, 64000] },
+    { label: "Försäkringsskador", values: [25383, 23000] },
+    { label: "Löner", values: [53250, 51000] },
+    { label: "Sociala avgifter", values: [17000, 16000] },
+  ], { title: "NOT 5, FASTIGHETSKOSTNADER", inlineTitle: true })];
+  const expected = new Map([
+    ["Reparationer", "Övriga repara�oner"],
+    ["Försäkringsärende/vattenskada", "Försäkringsskador"],
+    ["Löner, arbetare", "Löner"],
+  ]);
+  const capturedEvidence = new Map<string, { deterministicEqual: boolean; sameReportedYear: boolean; samePdfPage: boolean; sameTableOrdinal: boolean; sharedNearbyRows: string[] }>();
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023, {
+    resolveLabels: async (newerRows, olderRows, _groups, directPairs) => {
+      const mappings = [...expected].flatMap(([newerLabel, olderLabel]) => {
+        const newerRow = newerRows.find((row) => row.label === newerLabel);
+        const olderRow = olderRows.find((row) => row.label === olderLabel);
+        if (!newerRow || !olderRow) return [];
+        const pair = directPairs.find(
+          (candidate) => candidate.newerId === newerRow.id && candidate.olderId === olderRow.id,
+        );
+        if (!pair) return [];
+        capturedEvidence.set(newerLabel, pair.evidence);
+        return [{
+          newerIds: [newerRow.id],
+          olderIds: [olderRow.id],
+          relationship: "direct" as const,
+          judgment: {
+            basis: "jev" as const,
+            decision: "aligned" as const,
+            confidence: 0.98,
+            outcomeProbability: 0.99,
+          },
+        }];
+      });
+      return { mappings };
+    },
+  });
+
+  for (const [newerLabel, olderLabel] of expected) {
+    const evidence = capturedEvidence.get(newerLabel);
+    assert.ok(evidence, `${newerLabel} candidate is sent to Jev`);
+    assert.equal(evidence.deterministicEqual, true);
+    assert.equal(evidence.sameReportedYear, true);
+    assert.equal(evidence.samePdfPage, true);
+    assert.equal(evidence.sameTableOrdinal, true);
+    const control = result.discrepancies.find((item) => item.labelNew === newerLabel);
+    assert.ok(control, JSON.stringify(result.discrepancies.map((item) => item.labelNew)));
+    assert.equal(control?.status, "match", JSON.stringify({ modelAssisted: result.modelAssisted, discrepancies: result.discrepancies }));
+    assert.equal(control?.labelOld, olderLabel);
+    assert.equal(control?.matchMethod, "model");
+    assert.equal(control?.judgment.outcomeProbability, 0.99);
+  }
+});
+
+test("an equal machinery opening balance aligns across a shifted page and stale table title", async () => {
+  const newer = Array.from({ length: 10 }, (_, page) => reportPage(page, [2024, 2023]));
+  const older = Array.from({ length: 10 }, (_, page) => reportPage(page, [2023, 2022]));
+  newer[8] = reportPage(8, [2024, 2023], [
+    { label: "Ackumulerat anskaffningsvärde — Ingående", values: [300000, 272414] },
+    { label: "Utgående ackumulerat anskaffningsvärde", values: [320000, 290000] },
+    { label: "Ackumulerade avskrivningar", values: [-120000, -110000] },
+  ], { title: "Maskiner och inventarier" });
+  older[7] = reportPage(7, [2023, 2022], [
+    { label: "Ackumulerat anskaffningsvärde — Ingående", values: [272414, 250000] },
+    { label: "Utgående ackumulerat anskaffningsvärde", values: [290000, 270000] },
+    { label: "Ackumulerade avskrivningar", values: [-110000, -100000] },
+  ], { title: "Taxeringsvärde" });
+  older[8] = reportPage(8, [2023, 2022], [
+    { label: "Ackumulerat anskaffningsvärde — Ingående", values: [58963, 50000] },
+    { label: "Ackumulerat anskaffningsvärde — Ingående", values: [58964, 50001] },
+  ], { title: "Maskiner och inventarier" });
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+
+  const target = result.discrepancies.find((item) =>
+    item.labelNew === "Ackumulerat anskaffningsvärde — Ingående" && item.newer.page === 8);
+  assert.ok(target, JSON.stringify(result.discrepancies.map((item) => [item.labelNew, item.newer.page])));
+  assert.equal(target?.status, "match", JSON.stringify({ modelAssisted: result.modelAssisted, discrepancies: result.discrepancies }));
+  assert.equal(target?.valueOld, "272414");
+  assert.equal(target?.older?.page, 7);
+  assert.equal(target?.judgment.basis, "deterministic");
+});
+
+test("a rejected Jev candidate remains gray with Jev review provenance", async () => {
+  const newer = [reportPage(0, [2025, 2024], [{ label: "Servicekostnad", values: [120, 100] }])];
+  const older = [reportPage(0, [2024, 2023], [{ label: "Administrationskostnad", values: [90, 80] }])];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => ({
+      mappings: [],
+      reviews: [{
+        newerId: newerRows[0].id,
+        olderId: olderRows[0].id,
+        decision: "unlinked",
+        judgment: {
+          basis: "jev",
+          decision: "unlinked",
+          confidence: 0.91,
+          outcomeProbability: 0.04,
+          probabilities: { 0: 0.93, 1: 0.03, 2: 0.04 },
+        },
+      }],
+    }),
+  });
+  assert.equal(result.discrepancies[0].status, "missing");
+  assert.equal(result.discrepancies[0].judgment.basis, "jev");
+  assert.equal(result.discrepancies[0].judgment.decision, "unlinked");
+  assert.match(result.discrepancies[0].explanation, /Jev reviewed possible counterparts/);
+});
+
 test("residual Övrigt labels can map to a specific renamed key using note context", async () => {
   const newer = [reportPage(0, [2025, 2024], [
     { label: "Övrigt", values: [130, 100] },
@@ -588,16 +897,15 @@ test("residual Övrigt labels can map to a specific renamed key using note conte
   ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
 
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
-    resolveLabels: async (newerRows, olderRows, proposedGroups) => {
+    resolveLabels: async (newerRows, olderRows, _proposedGroups, directPairs) => {
       const residual = newerRows.find((row) => row.label === "Övrigt");
       const renamed = olderRows.find((row) => row.label === "Bank- och administrationskostnader");
       assert.equal(residual?.tableTitle, "NOT 9, ÖVRIGA EXTERNA KOSTNADER");
       assert.ok(residual?.nearbyRows.includes("Revisionsarvoden"));
       assert.ok(residual && renamed);
-      assert.ok(proposedGroups.some((proposal) =>
-        proposal.relationship === "direct" &&
-        proposal.newerIds[0] === residual.id &&
-        proposal.olderIds[0] === renamed.id));
+      assert.ok(directPairs.some((proposal) =>
+        proposal.newerId === residual.id &&
+        proposal.olderId === renamed.id));
       return {
         mappings: [{ newerIds: [residual.id], olderIds: [renamed.id], relationship: "direct" }],
       };
@@ -608,6 +916,165 @@ test("residual Övrigt labels can map to a specific renamed key using note conte
   assert.equal(residual?.status, "match");
   assert.equal(residual?.labelOld, "Bank- och administrationskostnader");
   assert.equal(residual?.matchMethod, "model");
+});
+
+test("an unequal residual label cannot become red and does not hide an equal renamed row", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Övrigt", values: [130, 100] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Övrigt", values: [99, 70] },
+    { label: "Klottersanering", values: [100, 60] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => {
+      const residual = newerRows.find((row) => row.label === "Övrigt");
+      const renamed = olderRows.find((row) => row.label === "Klottersanering");
+      assert.ok(residual && renamed);
+      return { mappings: [{
+        newerIds: [residual.id],
+        olderIds: [renamed.id],
+        relationship: "direct",
+      }] };
+    },
+  });
+
+  assert.equal(result.discrepancies[0].status, "match");
+  assert.equal(result.discrepancies[0].labelOld, "Klottersanering");
+  assert.equal(result.discrepancies[0].matchMethod, "model");
+});
+
+test("Jev questions isolate semantic judgments and keep values out of state", () => {
+  const newerRows = [{
+    id: "new-1", label: "Övrigt", section: "Notes", year: 2024, page: 9, table: 1,
+    tableTitle: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", nearbyRows: ["Revisionsarvoden"],
+  }];
+  const olderRows = [{
+    id: "old-1", label: "Bankkostnader", section: "Notes", year: 2024, page: 8, table: 1,
+    tableTitle: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", nearbyRows: ["Revisionsarvoden"], value: 42,
+  }];
+  const definition = buildTypeSafeRequest({
+    newerRows,
+    olderRows,
+    directPairs: [{
+      newerId: "new-1",
+      olderId: "old-1",
+      evidence: {
+        deterministicEqual: true,
+        sameReportedYear: true,
+        samePdfPage: false,
+        pageDelta: 1,
+        sameTableOrdinal: true,
+        sameSection: true,
+        tableTitleSimilarity: 1,
+        rowDistancePoints: null,
+        sameRowPosition: false,
+        damagedGlyph: false,
+        sharedNearbyRows: ["Revisionsarvoden"],
+      },
+    }],
+    proposedGroups: [],
+  });
+  const serialized = JSON.stringify(definition.request);
+  assert.match(serialized, /Residual labels such as Övrigt/);
+  assert.match(serialized, /safest reconciliation action/);
+  assert.match(serialized, /"deterministicEqual":true/);
+  assert.match(serialized, /"sharedNearbyRows":\["Revisionsarvoden"\]/);
+  assert.doesNotMatch(serialized, /"value":42/);
+  assert.equal(Object.keys(definition.request.questions).length, 1);
+});
+
+test("Jev mappings reject ambiguous direct pairs and retain aggregate confidence", () => {
+  const scoreAnswer = (value: number) => ({
+    type: "score" as const,
+    score: value,
+    confidence: 0.8,
+    probabilities: { 0: 0.1, 1: 0.1, 2: 0.8 },
+    legend: { 0: "different", 1: "uncertain", 2: "same" },
+  });
+  const result = mappingsFromTypeSafe(
+    [
+      { newerId: "new-1", olderId: "old-1" },
+      { newerId: "new-1", olderId: "old-2" },
+      { newerId: "new-2", olderId: "old-3" },
+    ],
+    [{ newerIds: ["new-3"], olderIds: ["old-4", "old-5"], relationship: "aggregate" }],
+    {
+      direct_0: scoreAnswer(1.8),
+      direct_1: scoreAnswer(1.7),
+      direct_2: scoreAnswer(1.6),
+      aggregate_concept_0: scoreAnswer(1.9),
+      aggregate_structure_0: scoreAnswer(1.8),
+    },
+  );
+  assert.deepEqual(result.mappings.map(({ newerIds, olderIds, relationship }) => ({
+    newerIds,
+    olderIds,
+    relationship,
+  })), [
+    { newerIds: ["new-3"], olderIds: ["old-4", "old-5"], relationship: "aggregate" },
+    { newerIds: ["new-2"], olderIds: ["old-3"], relationship: "direct" },
+  ]);
+  assert.equal(result.mappings[0].judgment?.basis, "jev");
+  assert.equal(result.mappings[0].judgment?.confidence, 0.8);
+  assert.equal(result.mappings[0].judgment?.components?.length, 2);
+  assert.equal(result.reviews.length, 3);
+  assert.equal(result.reviews[0].judgment.decision, "aligned");
+});
+
+test("a low-confidence aggregate is approved only when coherent is the dominant outcome", () => {
+  const answer = (
+    scoreValue: number,
+    confidence: number,
+    distribution: Record<string, number>,
+  ) => ({
+    type: "score" as const,
+    score: scoreValue,
+    confidence,
+    probabilities: distribution,
+    legend: { 0: "incoherent", 1: "uncertain", 2: "coherent" },
+  });
+  const result = mappingsFromTypeSafe(
+    [],
+    [{
+      newerIds: ["new-1"],
+      olderIds: ["old-1", "old-2"],
+      relationship: "aggregate",
+      termQuestionIds: ["aggregate_term_0_older_1"],
+    }],
+    {
+      aggregate_concept_0: answer(1, 0, { 0: 0.2, 1: 0.6, 2: 0.2 }),
+      aggregate_structure_0: answer(1.3, 0.2, { 0: 0.2, 1: 0.3, 2: 0.5 }),
+      aggregate_term_0_older_1: answer(1.2, 0, { 0: 0.25, 1: 0.3, 2: 0.45 }),
+    },
+  );
+
+  assert.equal(result.mappings.length, 1);
+  assert.equal(result.mappings[0].judgment?.confidence, 0);
+  assert.equal(result.mappings[0].judgment?.outcomeProbability, 0.435);
+  assert.equal(result.mappings[0].judgment?.probabilities?.["2"], 0.435);
+  assert.equal("termQuestionIds" in result.mappings[0], false);
+});
+
+test("a direct alignment needs majority probability, not only a plurality", () => {
+  const result = mappingsFromTypeSafe(
+    [{ newerId: "new-1", olderId: "old-1" }],
+    [],
+    {
+      direct_0: {
+        type: "score",
+        score: 1.18,
+        confidence: 0,
+        probabilities: { 0: 0.3, 1: 0.22, 2: 0.48 },
+        legend: { 0: "unlinked", 1: "review", 2: "aligned" },
+      },
+    },
+  );
+
+  assert.equal(result.mappings.length, 0);
+  assert.equal(result.reviews[0].decision, "review");
+  assert.equal(result.reviews[0].judgment.outcomeProbability, 0.48);
 });
 
 test("an omitted equal residual proposal gets one focused semantic retry", async () => {
@@ -622,51 +1089,25 @@ test("an omitted equal residual proposal gets one focused semantic retry", async
   let calls = 0;
 
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
-    resolveLabels: async (newerRows, olderRows, proposals) => {
+    resolveLabels: async (newerRows, olderRows, _groups, directPairs) => {
       calls += 1;
-      const proposal = proposals.find((item) => item.relationship === "direct");
-      assert.ok(proposal);
+      const pair = directPairs.find((item) => item.evidence.deterministicEqual);
+      assert.ok(pair);
       if (calls === 1) return { mappings: [] };
       assert.equal(newerRows.length, 1);
       assert.equal(olderRows.length, 1);
-      return { mappings: [{ ...proposal, reason: "Same note occurrence and aligned neighboring rows." }] };
+      return { mappings: [{
+        newerIds: [pair.newerId],
+        olderIds: [pair.olderId],
+        relationship: "direct",
+        judgment: { basis: "jev", decision: "aligned", outcomeProbability: 0.9, confidence: 0.8 },
+      }] };
     },
   });
 
   assert.equal(calls, 2);
   assert.equal(result.discrepancies.find((item) => item.labelNew === "Övrigt")?.status, "match");
   assert.equal(result.modelReview.batchesAttempted, 2);
-});
-
-test("semantic matching prompt explicitly treats residual labels as contextual", () => {
-  const definition = requestDefinition("match-labels", { newerRows: [], olderRows: [] });
-  assert.match(definition.system || "", /Residual labels such as “Övrigt”/);
-  assert.match(definition.system || "", /note title\s+and neighboring stable rows/);
-  assert.match(definition.system || "", /Never match two residual rows merely because/);
-  assert.match(definition.system || "", /Use direct for one-to-one equivalent concepts/);
-  assert.match(definition.system || "", /proposed direct pair and aggregate group/);
-  assert.match(definition.prompt, /Deterministically equal proposals/);
-  const mappingSchema = (((definition.schema.properties as Record<string, unknown>).mappings as {
-    items: { required: string[] };
-  }).items.required);
-  assert.ok(mappingSchema.includes("reason"));
-});
-
-test("application validation rejects malformed structured model results", () => {
-  assert.throws(
-    () => validateModelResult("synonym", { synonym: "rad\nbrytning", reason: "unsafe" }),
-    /validation/,
-  );
-  assert.throws(
-    () => validateModelResult("match-labels", {
-      mappings: [{ newerIds: ["new"], olderIds: ["old"], relationship: "direct" }],
-    }),
-    /validation/,
-  );
-  assert.deepEqual(
-    validateModelResult("connection", { ok: true, ignored: "not forwarded" }),
-    { ok: true },
-  );
 });
 
 test("model-assisted split rows are checked arithmetically and grouped", async () => {
@@ -974,11 +1415,11 @@ test("semantic and arithmetic review continues beyond the first model batch", as
     },
   });
 
-  assert.equal(calls, 3);
+  assert.equal(calls, 4);
   const grouped = result.discrepancies.find((item) => item.labelNew === "Rad 44");
   assert.equal(grouped?.status, "match");
   assert.equal(grouped?.arithmetic?.expression, "100 = 40 + 20 + 40");
-  assert.equal(result.modelReview.batchesAttempted, 3);
+  assert.equal(result.modelReview.batchesAttempted, 4);
   assert.equal(result.modelReview.batchesFailed, 0);
 });
 
