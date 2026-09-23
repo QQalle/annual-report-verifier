@@ -64,7 +64,6 @@ function semanticLabel(label: string) {
   return label.toLocaleLowerCase("sv-SE").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9åäö]+/gi, " ").trim();
 }
-
 function sanitizeRows(value: unknown, limit: number): ModelRow[] {
   return (Array.isArray(value) ? value : []).slice(0, limit).map((item) => {
     const row = item && typeof item === "object" ? item as Record<string, unknown> : {};

@@ -190,6 +190,25 @@ function mockPdf(pages: ExtractedPage[]) {
   } as unknown as BrowserPdf;
 }
 
+function withUnlabeledRuledTotal(page: ExtractedPage, values: [number, number], y = 126) {
+  const lineId = `p${page.page}-unlabeled-total`;
+  const totalLine: PdfLine = {
+    id: lineId,
+    page: page.page,
+    text: values.join(" "),
+    rect: [300, y, 420, y + 12],
+    tokens: [
+      token(`${lineId}-v0`, page.page, String(values[0]), [300, y, 320, y + 12], true, lineId),
+      token(`${lineId}-v1`, page.page, String(values[1]), [400, y, 420, y + 12], true, lineId),
+    ],
+  };
+  page.lines.push(totalLine);
+  page.tokens.push(...totalLine.tokens);
+  page.text += `\n${totalLine.text}`;
+  page.horizontalRules = [[30, y - 3, 440, y - 2]];
+  return page;
+}
+
 test("parses annual-report number formats", () => {
   assert.equal(parseSwedishNumber("1\u202f234"), 1234);
   assert.equal(parseSwedishNumber("1,186"), 1186);
@@ -289,6 +308,85 @@ test("keeps side-by-side key-figure tables in separate horizontal contexts", asy
   );
 });
 
+test("a preceding year header remains associated with the end of a long table", async () => {
+  const newer = [reportPage(0, [2024, 2023], [
+    { label: "SUMMA TILLGÅNGAR", values: [64000000, 59876526] },
+  ], { title: "BALANSRÄKNING", headerY: 50, rowStart: 550 })];
+  const older = [reportPage(0, [2023, 2022], [
+    { label: "SUMMA TILLGÅNGAR", values: [59876526, 51000000] },
+  ], { title: "BALANSRÄKNING", headerY: 50, rowStart: 550 })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  const total = result.discrepancies.find((item) => item.labelNew === "SUMMA TILLGÅNGAR");
+  assert.equal(total?.status, "match");
+  assert.equal(total?.valueOld, "59876526");
+});
+
+test("a vector rule turns an otherwise unlabeled numeric row into a verifiable total", async () => {
+  const newer = [withUnlabeledRuledTotal(reportPage(0, [2024, 2023], [
+    { label: "Årets avskrivningar", values: [300, 200] },
+  ], { title: "KASSAFLÖDESANALYS" }), [500, 250])];
+  const older = [withUnlabeledRuledTotal(reportPage(0, [2023, 2022], [
+    { label: "Årets avskrivningar", values: [200, 100] },
+  ], { title: "KASSAFLÖDESANALYS" }), [250, 125])];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  const total = result.discrepancies.find((item) => item.labelNew.startsWith("Unlabeled total after"));
+  assert.equal(total?.status, "match");
+  assert.equal(total?.evidence.reason, "structural-equal");
+  assert.equal(total?.evidence.labelAlignment, "structural");
+});
+
+test("an unequal unlabeled ruled total stays gray", async () => {
+  const newer = [withUnlabeledRuledTotal(reportPage(0, [2024, 2023], [
+    { label: "Årets avskrivningar", values: [300, 250] },
+  ], { title: "KASSAFLÖDESANALYS" }), [500, 250])];
+  const older = [withUnlabeledRuledTotal(reportPage(0, [2023, 2022], [
+    { label: "Årets avskrivningar", values: [200, 100] },
+  ], { title: "KASSAFLÖDESANALYS" }), [249, 125])];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
+  const total = result.discrepancies.find((item) => item.labelNew.startsWith("Unlabeled total after"));
+  assert.equal(total?.status, "missing");
+  assert.notEqual(total?.evidence.verdict, "discrepancy");
+});
+
+test("a unique damaged-glyph label can still prove an exact deterministic discrepancy", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Årsavgift per kvm upplåten bostadsrätt, kr", values: [700, 693] },
+  ], { title: "FLERÅRSÖVERSIKT" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Årsavgi� per kvm upplåten bostadsrä�, kr", values: [692, 680] },
+  ], { title: "FLERÅRSÖVERSIKT" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].evidence.reason, "exact-unequal");
+  assert.equal(result.discrepancies[0].evidence.labelAlignment, "damaged-text");
+});
+
+test("model confirmation cannot downgrade a damaged-glyph deterministic discrepancy", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Årsavgift per kvm upplåten bostadsrätt, kr", values: [700, 693] },
+  ], { title: "FLERÅRSÖVERSIKT" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Årsavgi� per kvm upplåten bostadsrä�, kr", values: [692, 680] },
+  ], { title: "FLERÅRSÖVERSIKT" })];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => ({
+      mappings: [{
+        newerIds: [newerRows[0].id],
+        olderIds: [olderRows[0].id],
+        relationship: "direct",
+      }],
+    }),
+  });
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].evidence.reason, "exact-unequal");
+  assert.equal(result.discrepancies[0].evidence.labelAlignment, "damaged-text");
+});
+
 test("compares and labels every opening balance in changes in equity", async () => {
   const newer = [reportPage(0, ["2023-12-31", "2024-12-31"], [
     { label: "Insatser", values: [72134, 72134] },
@@ -341,11 +439,11 @@ test("a unique unequal row remains red when the prior PDF text layer has damaged
   const newer = [reportPage(0, [2024, 2023], [{
     label: "Årsavgift per kvm upplåten bostadsrätt, kr",
     values: [800, 693],
-  }])];
+  }], { title: "FLERÅRSÖVERSIKT" })];
   const older = [reportPage(0, [2023, 2022], [{
     label: "Årsavgi� per kvm upplåten bostadsrä�, kr",
     values: [692, 600],
-  }])];
+  }], { title: "FLERÅRSÖVERSIKT" })];
 
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
   assert.equal(result.discrepancies[0].status, "mismatch");
@@ -416,6 +514,89 @@ test("scrambled numbers stay numeric and change", () => {
   const replacement = alterNumber("6 104");
   assert.notEqual(replacement, "6 104");
   assert.notEqual(parseSwedishNumber(replacement), null);
+});
+
+test("untouched downloads preserve source bytes and scrambled exports remove live source text", async () => {
+  const mupdf = (await import("mupdf")).default;
+  const fixture = new mupdf.PDFDocument();
+  const pageObject = fixture.addPage(
+    [0, 0, 300, 200],
+    0,
+    { Font: { F1: { Type: "Font", Subtype: "Type1", BaseFont: "Helvetica" } } },
+    new TextEncoder().encode("BT /F1 12 Tf 40 100 Td (Secret 123) Tj ET"),
+  );
+  fixture.insertPage(-1, pageObject);
+  const buffer = fixture.saveToBuffer("garbage=4");
+  const source = new Uint8Array(buffer.asUint8Array());
+  buffer.destroy();
+  fixture.destroy();
+
+  const pdf = await (await import("../lib/pdf-engine.ts")).BrowserPdf.load(source, "fixture.pdf");
+  assert.deepEqual(pdf.downloadBytes(), source, "the untouched download is byte-for-byte original");
+  const rendered = await pdf.renderPage(0, 1);
+  const png = new Uint8Array(await (await fetch(rendered.url)).arrayBuffer());
+  assert.deepEqual([...png.slice(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.equal(rendered.width, 300);
+  URL.revokeObjectURL(rendered.url);
+  const extracted = await pdf.extractPage(0);
+  const secret = extracted.tokens.find((item) => item.text === "Secret");
+  assert.ok(secret);
+  await pdf.applyChange({
+    id: secret.id,
+    page: secret.page,
+    rect: secret.rect,
+    original: secret.text,
+    replacement: "Public",
+    fontSize: secret.fontSize,
+    align: "left",
+  });
+  const exported = pdf.downloadBytes();
+  assert.notDeepEqual(exported, source);
+  const reopened = await (await import("../lib/pdf-engine.ts")).BrowserPdf.load(exported, "fixture-scrambled.pdf");
+  const exportedText = (await reopened.extractPage(0)).text;
+  assert.doesNotMatch(exportedText, /Secret/);
+  assert.match(exportedText, /Public/);
+  reopened.destroy();
+  pdf.destroy();
+});
+
+test("a local text-layer PDF pair produces coordinate-linked red evidence", async () => {
+  const mupdf = (await import("mupdf")).default;
+  const makePdf = (years: [number, number], values: [number, number]) => {
+    const document = new mupdf.PDFDocument();
+    const content = [
+      "BT /F1 12 Tf 30 750 Td (INCOME STATEMENT) Tj ET",
+      `BT /F1 10 Tf 280 700 Td (${years[0]}) Tj ET`,
+      `BT /F1 10 Tf 380 700 Td (${years[1]}) Tj ET`,
+      "BT /F1 10 Tf 30 650 Td (Nettoomsattning) Tj ET",
+      `BT /F1 10 Tf 290 650 Td (${values[0]}) Tj ET`,
+      `BT /F1 10 Tf 390 650 Td (${values[1]}) Tj ET`,
+    ].join("\n");
+    const page = document.addPage(
+      [0, 0, 600, 800],
+      0,
+      { Font: { F1: { Type: "Font", Subtype: "Type1", BaseFont: "Helvetica" } } },
+      new TextEncoder().encode(content),
+    );
+    document.insertPage(-1, page);
+    const saved = document.saveToBuffer("garbage=4");
+    const bytes = new Uint8Array(saved.asUint8Array());
+    saved.destroy();
+    document.destroy();
+    return bytes;
+  };
+  const { BrowserPdf: Pdf } = await import("../lib/pdf-engine.ts");
+  const newer = await Pdf.load(makePdf([2025, 2024], [130, 101]), "newer-2025.pdf");
+  const older = await Pdf.load(makePdf([2024, 2023], [100, 80]), "older-2024.pdf");
+  const result = await analyzePair(newer, older, 2025, 2024);
+  assert.equal(result.discrepancies.length, 1);
+  assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].newer.page, 0);
+  assert.equal(result.discrepancies[0].older?.page, 0);
+  assert.ok(result.discrepancies[0].newer.rect[2] > result.discrepancies[0].newer.rect[0]);
+  assert.ok(result.discrepancies[0].older!.keyRect);
+  newer.destroy();
+  older.destroy();
 });
 
 test("equal repeated rows use the agreeing context instead of an unequal duplicate", async () => {
@@ -489,10 +670,68 @@ test("equal trivial-value rows with unrelated labels are not offered as semantic
 });
 
 test("a unique exact row with unequal values is a discrepancy", async () => {
-  const newer = [reportPage(0, [2025, 2024], [{ label: "Nettoomsättning", values: [130, 101] }])];
-  const older = [reportPage(0, [2024, 2023], [{ label: "Nettoomsättning", values: [100, 80] }])];
+  const newer = [reportPage(0, [2025, 2024], [{ label: "Nettoomsättning", values: [130, 101] }], { title: "NOT 2, INTÄKTER" })];
+  const older = [reportPage(0, [2024, 2023], [{ label: "Nettoomsättning", values: [100, 80] }], { title: "NOT 2, INTÄKTER" })];
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
   assert.equal(result.discrepancies[0].status, "mismatch");
+  assert.equal(result.discrepancies[0].evidence.reason, "exact-unequal");
+  assert.equal(result.discrepancies[0].evidence.contextAlignment, "same-table");
+});
+
+test("an exact label in a different table context cannot become red", async () => {
+  const newer = [reportPage(0, [2025, 2024], [{ label: "Nettoomsättning", values: [130, 101] }], { title: "NOT 2, INTÄKTER" })];
+  const older = [reportPage(0, [2024, 2023], [{ label: "Nettoomsättning", values: [100, 80] }], { title: "NOT 8, SEGMENTSINFORMATION" })];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.equal(result.discrepancies[0].status, "missing");
+  assert.equal(result.discrepancies[0].evidence.verdict, "review");
+});
+
+test("a uniquely equal exact occurrence can follow a note that moved by one page", async () => {
+  const newer = [
+    reportPage(0, [2025, 2024]),
+    reportPage(1, [2025, 2024], [
+      { label: "Ackumulerat anskaffningsvärde Ingående", values: [150, 100] },
+    ]),
+  ];
+  const older = [
+    reportPage(0, [2024, 2023], [
+      { label: "Ackumulerat anskaffningsvärde Ingående", values: [100, 80] },
+    ]),
+    reportPage(1, [2024, 2023], [
+      { label: "Ackumulerat anskaffningsvärde Ingående", values: [59, 40] },
+    ]),
+  ];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.equal(result.discrepancies[0].status, "match");
+  assert.equal(result.discrepancies[0].older?.page, 0);
+  assert.equal(result.discrepancies[0].valueOld, "100");
+});
+
+test("a generic fallback table title is insufficient context for red", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Ingående anskaffningsvärde", values: [300, 272] },
+  ])];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Ingående anskaffningsvärde", values: [59, 0] },
+  ])];
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.equal(result.discrepancies[0].status, "missing");
+  assert.equal(result.discrepancies[0].evidence.contextAlignment, "compatible");
+});
+
+test("one prior occurrence cannot verify two newer rows", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Serviceavtal", values: [140, 100] },
+    { label: "Serviceavtal", values: [150, 100] },
+  ], { title: "NOT 5, REPARATIONER" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Serviceavtal", values: [100, 80] },
+  ], { title: "NOT 5, REPARATIONER" })];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024);
+  assert.deepEqual(result.discrepancies.map((item) => item.status), ["missing", "missing"]);
+  assert.ok(result.discrepancies.every((item) => item.evidence.reason === "counterpart-reused"));
 });
 
 test("an exact label in a different statement context stays gray", async () => {
@@ -592,7 +831,7 @@ test("Jev receives deterministic evidence for the expected Note 5 and salary ren
   }
 });
 
-test("Jev can align an equal machinery opening balance across a shifted page and stale table title", async () => {
+test("an equal machinery opening balance aligns across a shifted page and stale table title", async () => {
   const newer = Array.from({ length: 10 }, (_, page) => reportPage(page, [2024, 2023]));
   const older = Array.from({ length: 10 }, (_, page) => reportPage(page, [2023, 2022]));
   newer[8] = reportPage(8, [2024, 2023], [
@@ -610,44 +849,15 @@ test("Jev can align an equal machinery opening balance across a shifted page and
     { label: "Ackumulerat anskaffningsvärde — Ingående", values: [58964, 50001] },
   ], { title: "Maskiner och inventarier" });
 
-  let capturedMachineryEvidence: { deterministicEqual: boolean; samePdfPage: boolean; pageDelta: number; sharedNearbyRows: string[] } | undefined;
-  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023, {
-    resolveLabels: async (newerRows, olderRows, _groups, directPairs) => {
-      const targetNew = newerRows.find((row) => row.label.includes("Ackumulerat anskaffningsvärde"));
-      const targetOld = olderRows.find((row) => row.label.includes("Ackumulerat anskaffningsvärde") && row.page === 8);
-      if (!targetNew || !targetOld) return { mappings: [] };
-      const pair = directPairs.find(
-        (candidate) => candidate.newerId === targetNew.id && candidate.olderId === targetOld.id,
-      );
-      if (!pair) return { mappings: [] };
-      capturedMachineryEvidence = pair.evidence;
-      return {
-        mappings: [{
-          newerIds: [targetNew.id],
-          olderIds: [targetOld.id],
-          relationship: "direct",
-          judgment: {
-            basis: "jev",
-            decision: "aligned",
-            confidence: 0.75,
-            outcomeProbability: 0.87,
-          },
-        }],
-      };
-    },
-  });
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023);
 
   const target = result.discrepancies.find((item) =>
     item.labelNew === "Ackumulerat anskaffningsvärde — Ingående" && item.newer.page === 8);
-  assert.ok(capturedMachineryEvidence);
-  assert.equal(capturedMachineryEvidence.deterministicEqual, true);
-  assert.equal(capturedMachineryEvidence.samePdfPage, false);
-  assert.equal(capturedMachineryEvidence.pageDelta, 1);
-  assert.ok(capturedMachineryEvidence.sharedNearbyRows.length >= 2);
   assert.ok(target, JSON.stringify(result.discrepancies.map((item) => [item.labelNew, item.newer.page])));
   assert.equal(target?.status, "match", JSON.stringify({ modelAssisted: result.modelAssisted, discrepancies: result.discrepancies }));
   assert.equal(target?.valueOld, "272414");
-  assert.equal(target?.judgment.outcomeProbability, 0.87);
+  assert.equal(target?.older?.page, 7);
+  assert.equal(target?.judgment.basis, "deterministic");
 });
 
 test("a rejected Jev candidate remains gray with Jev review provenance", async () => {
@@ -687,12 +897,15 @@ test("residual Övrigt labels can map to a specific renamed key using note conte
   ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
 
   const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
-    resolveLabels: async (newerRows, olderRows) => {
+    resolveLabels: async (newerRows, olderRows, _proposedGroups, directPairs) => {
       const residual = newerRows.find((row) => row.label === "Övrigt");
       const renamed = olderRows.find((row) => row.label === "Bank- och administrationskostnader");
       assert.equal(residual?.tableTitle, "NOT 9, ÖVRIGA EXTERNA KOSTNADER");
       assert.ok(residual?.nearbyRows.includes("Revisionsarvoden"));
       assert.ok(residual && renamed);
+      assert.ok(directPairs.some((proposal) =>
+        proposal.newerId === residual.id &&
+        proposal.olderId === renamed.id));
       return {
         mappings: [{ newerIds: [residual.id], olderIds: [renamed.id], relationship: "direct" }],
       };
@@ -864,6 +1077,39 @@ test("a direct alignment needs majority probability, not only a plurality", () =
   assert.equal(result.reviews[0].judgment.outcomeProbability, 0.48);
 });
 
+test("an omitted equal residual proposal gets one focused semantic retry", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Övrigt", values: [130, 100] },
+    { label: "Revisionsarvoden", values: [90, 80] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Klottersanering", values: [100, 70] },
+    { label: "Revisionsarvoden", values: [80, 75] },
+  ], { title: "NOT 9, ÖVRIGA EXTERNA KOSTNADER", inlineTitle: true })];
+  let calls = 0;
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows, _groups, directPairs) => {
+      calls += 1;
+      const pair = directPairs.find((item) => item.evidence.deterministicEqual);
+      assert.ok(pair);
+      if (calls === 1) return { mappings: [] };
+      assert.equal(newerRows.length, 1);
+      assert.equal(olderRows.length, 1);
+      return { mappings: [{
+        newerIds: [pair.newerId],
+        olderIds: [pair.olderId],
+        relationship: "direct",
+        judgment: { basis: "jev", decision: "aligned", outcomeProbability: 0.9, confidence: 0.8 },
+      }] };
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(result.discrepancies.find((item) => item.labelNew === "Övrigt")?.status, "match");
+  assert.equal(result.modelReview.batchesAttempted, 2);
+});
+
 test("model-assisted split rows are checked arithmetically and grouped", async () => {
   const newer = [reportPage(0, [2025, 2024], [
     { label: "Serviceavtal", values: [55, 40] },
@@ -937,6 +1183,29 @@ test("model cannot invent an aggregate that was not deterministically proposed",
   assert.equal(result.modelAssisted, 0);
   assert.equal(result.discrepancies[0].status, "missing");
   assert.equal(result.discrepancies[0].arithmetic, undefined);
+});
+
+test("model mappings cannot reuse a row already protected by an exact equal match", async () => {
+  const newer = [reportPage(0, [2025, 2024], [
+    { label: "Serviceavtal", values: [130, 100] },
+    { label: "Utökad support", values: [80, 60] },
+  ], { title: "NOT 5, REPARATIONER" })];
+  const older = [reportPage(0, [2024, 2023], [
+    { label: "Serviceavtal", values: [100, 90] },
+  ], { title: "NOT 5, REPARATIONER" })];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async (newerRows, olderRows) => ({
+      mappings: [{
+        newerIds: [newerRows.find((row) => row.label === "Utökad support")!.id],
+        olderIds: [olderRows[0].id],
+        relationship: "direct",
+      }],
+    }),
+  });
+  assert.equal(result.discrepancies.find((item) => item.labelNew === "Serviceavtal")?.status, "match");
+  assert.equal(result.discrepancies.find((item) => item.labelNew === "Utökad support")?.status, "missing");
+  assert.equal(result.modelReview.mappingsAccepted, 0);
+  assert.equal(result.modelReview.mappingsRejected, 1);
 });
 
 test("an unequal model-assisted rename remains gray", async () => {
@@ -1057,6 +1326,39 @@ test("deterministic proposals surface a broader key plus folded-in prior rows", 
   assert.equal(grouped?.olderRelated?.length, 2);
 });
 
+test("arithmetic proposals reserve their rows beyond the global model-candidate cap", async () => {
+  const newer = Array.from({ length: 10 }, (_, page) =>
+    reportPage(page, [2024, 2023], page === 9
+      ? [{ label: "Övriga förvaltningskostnader", values: [70000, 68908] }]
+      : [{ label: `Ny rad ${page}`, values: [90000 + page, 80000 + page] }],
+    { title: `NOT ${page + 1}, KOSTNADER` }));
+  const older = Array.from({ length: 10 }, (_, page) =>
+    reportPage(page, [2023, 2022], page === 9
+      ? [
+          { label: "Övriga förvaltningskostnader", values: [59645, 50099] },
+          { label: "Trivselåtgärder", values: [2465, 4200] },
+          { label: "Bankkostnader", values: [6798, 6348] },
+        ]
+      : Array.from({ length: 18 }, (__, row) => ({
+          label: `Äldre rad ${page}-${row}`,
+          values: [30000 + page * 100 + row, 20000 + row] as [number, number],
+        })),
+    { title: `NOT ${page + 1}, KOSTNADER` }));
+
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2024, 2023, {
+    resolveLabels: async (_newerRows, olderRows, proposedGroups) => {
+      const proposal = proposedGroups.find((group) => group.olderIds.length === 3);
+      assert.ok(proposal, "the late-page exact arithmetic proposal survives prompt bounding");
+      assert.ok(proposal.olderIds.every((id) => olderRows.some((row) => row.id === id)));
+      return { mappings: [proposal] };
+    },
+  });
+
+  const grouped = result.discrepancies.find((item) => item.labelNew === "Övriga förvaltningskostnader");
+  assert.equal(grouped?.status, "match");
+  assert.equal(grouped?.arithmetic?.expression, "68908 = 59645 + 2465 + 6798");
+});
+
 test("an approved aggregate takes precedence over a competing direct anchor mapping", async () => {
   const newer = [reportPage(0, [2024, 2023], [
     { label: "Övriga förvaltningskostnader", values: [68611, 68908] },
@@ -1117,4 +1419,17 @@ test("semantic and arithmetic review continues beyond the first model batch", as
   const grouped = result.discrepancies.find((item) => item.labelNew === "Rad 44");
   assert.equal(grouped?.status, "match");
   assert.equal(grouped?.arithmetic?.expression, "100 = 40 + 20 + 40");
+  assert.equal(result.modelReview.batchesAttempted, 4);
+  assert.equal(result.modelReview.batchesFailed, 0);
+});
+
+test("a failed semantic batch is observable and leaves deterministic analysis usable", async () => {
+  const newer = [reportPage(0, [2025, 2024], [{ label: "Nytt namn", values: [130, 100] }])];
+  const older = [reportPage(0, [2024, 2023], [{ label: "Gammalt namn", values: [100, 80] }])];
+  const result = await analyzePair(mockPdf(newer), mockPdf(older), 2025, 2024, {
+    resolveLabels: async () => { throw new Error("provider unavailable"); },
+  });
+  assert.equal(result.discrepancies[0].status, "missing");
+  assert.equal(result.modelReview.batchesAttempted, 1);
+  assert.equal(result.modelReview.batchesFailed, 1);
 });

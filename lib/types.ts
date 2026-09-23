@@ -24,6 +24,8 @@ export type ExtractedPage = {
   text: string;
   tokens: PdfToken[];
   lines: PdfLine[];
+  /** Thin horizontal vector rules from the same PDF page content stream. */
+  horizontalRules?: Rect[];
 };
 
 export type RenderedPage = {
@@ -63,6 +65,33 @@ export type ReportPair = {
 };
 
 export type DiscrepancyStatus = "match" | "mismatch" | "missing";
+
+export type ReviewReason =
+  | "exact-equal"
+  | "damaged-text-equal"
+  | "structural-equal"
+  | "model-equal"
+  | "aggregate-equal"
+  | "exact-unequal"
+  | "ambiguous-counterpart"
+  | "counterpart-reused"
+  | "weak-counterpart"
+  | "model-unequal"
+  | "no-counterpart";
+
+export type ComparisonEvidence = {
+  reason: ReviewReason;
+  verdict: "verified" | "discrepancy" | "review";
+  labelAlignment: "exact" | "damaged-text" | "structural" | "semantic" | "weak" | "none";
+  contextAlignment: "same-table" | "compatible" | "weak" | "none";
+  uniqueCounterpart: boolean;
+  candidateCount: number;
+  deterministic: true;
+  normalizedNewer: number;
+  normalizedOlder?: number;
+  modelRole: "none" | "rename" | "arithmetic-coherence";
+  modelReason?: string;
+};
 
 export type EvidenceTarget = {
   page: number;
@@ -110,6 +139,7 @@ export type Discrepancy = {
   olderRelated?: EvidenceTarget[];
   arithmetic?: ArithmeticCheck;
   judgment: ControlJudgment;
+  evidence: ComparisonEvidence;
 };
 
 export type NumberHighlight = { page: number; rect: Rect; tokenId: string };
@@ -130,6 +160,21 @@ export type AnalysisResult = {
   olderYear: number;
   comparedCells: number;
   modelAssisted: number;
+  coverage: {
+    newerExtractedCells: number;
+    olderExtractedCells: number;
+    overlappingYearCells: number;
+    verifiedCells: number;
+    reviewCells: number;
+    discrepancyCells: number;
+  };
+  modelReview: {
+    enabled: boolean;
+    batchesAttempted: number;
+    batchesFailed: number;
+    mappingsAccepted: number;
+    mappingsRejected: number;
+  };
 };
 
 export type ModelProvider = "typesafe";
